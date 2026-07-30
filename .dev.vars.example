@@ -1,0 +1,18 @@
+# Copy to `.dev.vars` (gitignored) for local `wrangler dev`.
+#
+# For a DEPLOYMENT these are set as secrets instead — a `.env`/`.dev.vars` file
+# never reaches Cloudflare:
+#
+#   npx wrangler secret put REQUEST_STATE_KEY
+#   npx wrangler secret put ACCESS_TEAM_DOMAIN
+#   npx wrangler secret put ACCESS_AUD
+
+# Seals the multi-round-trip `request_state`. Required — the server refuses to
+# boot without it. At least 32 bytes:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+REQUEST_STATE_KEY="replace-me-with-32-plus-bytes-of-secret-randomness"
+
+# Cloudflare Access. Both unset = NO authentication (fine locally, not in
+# production). See AUTH.md for where to find these in the Zero Trust dashboard.
+# ACCESS_TEAM_DOMAIN="yourteam.cloudflareaccess.com"
+# ACCESS_AUD="your-access-application-aud-tag"

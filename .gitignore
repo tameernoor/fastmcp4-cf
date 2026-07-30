@@ -1,0 +1,20 @@
+node_modules/
+.wrangler/
+
+# Local config — never commit. `.dev.vars.example` is the template.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+
+# Cloudflare Access service-token credentials, for non-interactive probing.
+.svc-token
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+stash/
+.DS_Store

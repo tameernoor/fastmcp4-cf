@@ -1,0 +1,19 @@
+{
+  "name": "fastmcp4-cf",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A FastMCP 4 server (MCP 2026-07-28) on Cloudflare Containers",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler deploy --dry-run",
+    "tail": "wrangler tail"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.3.7"
+  },
+  "devDependencies": {
+    "wrangler": "^4.115.0"
+  }
+}

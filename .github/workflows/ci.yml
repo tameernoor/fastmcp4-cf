@@ -1,0 +1,152 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile server.py
+        run: python -m py_compile server.py
+      - name: Shellcheck probe.sh
+        run: shellcheck probe.sh
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      # Type-checks the Worker, validates the container/DO/migration wiring,
+      # and builds the image — without needing a Cloudflare account.
+      - name: wrangler deploy --dry-run
+        run: npx wrangler deploy --dry-run
+
+  # The one that matters: boots the real container behind the real Worker and
+  # drives a full multi-round-trip. Round 2 is routed by getRandom, so it will
+  # usually land on a different instance than round 1 — which is exactly what
+  # a per-process sealing key would break.
+  round-trip:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+
+      - name: Generate a request-state key
+        run: python -c "import secrets; print(f'REQUEST_STATE_KEY=\"{secrets.token_hex(32)}\"')" > .dev.vars
+
+      - name: Start wrangler dev
+        run: |
+          npx wrangler dev --port 8787 > /tmp/wrangler.log 2>&1 &
+          for i in $(seq 1 90); do
+            grep -q "Ready on" /tmp/wrangler.log && exit 0
+            sleep 2
+          done
+          echo "wrangler dev did not become ready"; cat /tmp/wrangler.log; exit 1
+
+      - name: server/discover advertises 2026-07-28
+        run: |
+          ./probe.sh http://localhost:8787 server/discover \
+            | tee /dev/stderr \
+            | python -c "
+          import json,sys
+          r = json.load(sys.stdin)['result']
+          assert '2026-07-28' in r['supportedVersions'], r['supportedVersions']
+          assert r['resultType'] == 'complete', r['resultType']
+          print('ok: supportedVersions', r['supportedVersions'])"
+
+      - name: tools/call with no handshake
+        run: |
+          ./probe.sh http://localhost:8787 tools/call whoami \
+            | python -c "
+          import json,sys
+          r = json.load(sys.stdin)['result']
+          assert r['resultType'] == 'complete', r
+          print('ok:', r['content'][0]['text'][:60].replace(chr(10),' '))"
+
+      - name: MRTR round-trip survives cross-instance routing
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 6); do
+            STATE=$(./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"ci"}' \
+              | python -c "
+          import json,sys
+          r = json.load(sys.stdin)['result']
+          assert r['resultType'] == 'input_required', r
+          print(r['requestState'])")
+            ./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"ci"}' \
+              '{"confirm":{"action":"accept","content":{"value":true}}}' "$STATE" \
+              | python -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          assert 'error' not in d, d['error']
+          assert d['result']['resultType'] == 'complete', d
+          print('  round-trip $i ok')"
+          done
+
+      # Regression test for the dual-era routing bug. A 2025-era client gets a
+      # session held in ONE container's memory; if the Worker fans its later
+      # requests across the pool, most of them come back `-32600 Session not
+      # found` and the client reports the server as having no tools.
+      - name: Legacy session survives repeated requests
+        run: |
+          set -euo pipefail
+          URL=http://localhost:8787/mcp
+          SID=$(curl -sS -D /tmp/legacy-headers.txt -o /dev/null -X POST $URL \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2025-11-25' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'
+            grep -i "mcp-session-id" /tmp/legacy-headers.txt | tr -d '\r' | awk '{print $2}')
+          test -n "$SID" || { echo "no session id issued"; exit 1; }
+          echo "session: $SID"
+          for i in $(seq 1 8); do
+            curl -sS -X POST $URL \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -H 'MCP-Protocol-Version: 2025-11-25' \
+              -H "Mcp-Session-Id: $SID" \
+              -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
+              | python -c "
+          import sys, json
+          raw = sys.stdin.read()
+          lines = [l for l in raw.splitlines() if l.startswith('data: ')]
+          d = json.loads(lines[0][6:]) if lines else json.loads(raw)
+          assert 'error' not in d, 'legacy session broke: ' + d['error']['message']
+          assert d['result']['tools'], 'no tools returned'
+          print('  legacy tools/list $i ok —', [t['name'] for t in d['result']['tools']])"
+          done
+
+      - name: Tampered request_state is rejected
+        run: |
+          set -euo pipefail
+          STATE=$(./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"ci"}' \
+            | python -c "import json,sys; print(json.load(sys.stdin)['result']['requestState'])")
+          BAD=$(printf '%s' "$STATE" | sed 's/^v1\..\{6\}/v1.AAAAAA/')
+          ./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"ci"}' \
+            '{"confirm":{"action":"accept","content":{"value":true}}}' "$BAD" \
+            | python -c "
+          import json,sys
+          d = json.load(sys.stdin)
+          assert 'error' in d, 'tampered state was ACCEPTED: ' + json.dumps(d)
+          print('ok: rejected —', d['error']['message'])"
+
+      - name: Wrangler log on failure
+        if: failure()
+        run: cat /tmp/wrangler.log
