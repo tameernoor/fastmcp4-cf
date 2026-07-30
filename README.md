@@ -78,20 +78,40 @@ python -c "import secrets; print(secrets.token_hex(32))"   # paste into .dev.var
 npm run dev                                                # ready on :8787
 ```
 
-`.dev.vars` is local-dev config and deliberately holds no auth settings — you
-cannot mint a Cloudflare Access token on localhost, so adding them makes every
-local request `401`. Deploy-time values live in `.deploy.vars` instead.
+Then, in another shell:
 
 ```bash
-
 ./probe.sh http://localhost:8787 server/discover
 ./probe.sh http://localhost:8787 tools/call whoami
 ```
+
+`.dev.vars` is local-dev config and deliberately holds no auth settings — you
+cannot mint a Cloudflare Access token on localhost, so adding them makes every
+local request `401`. Deploy-time values live in `.deploy.vars` instead.
 
 `server/discover` replaced the `initialize` handshake — it returns
 `supportedVersions`, `resultType`, `instructions`, and cache hints. Call
 `whoami` a few times and watch `instance` change: several containers answering
 one client, no session between them.
+
+### Faster loop: no Docker, no Worker
+
+`wrangler dev` rebuilds the image on every start, which is slow when you are
+just iterating on tool code. To run the MCP server on its own — no container,
+no Worker, no load balancing, but the same protocol:
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install --pre -r requirements.txt
+
+REQUEST_STATE_KEY=$(python -c "import secrets; print(secrets.token_hex(32))") \
+  PORT=9000 python server.py
+
+./probe.sh http://localhost:9000 tools/call whoami
+```
+
+Use `wrangler dev` when you care about the Worker, the routing, or anything
+Cloudflare-shaped; use this when you are writing tools.
 
 ### The server asking a question back
 
