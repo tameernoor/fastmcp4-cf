@@ -18,13 +18,13 @@
 
   // The Python image. wrangler builds this Dockerfile and pushes it to
   // Cloudflare's registry on deploy.
-  // max_instances must cover every distinct instance name src/index.ts can
-  // address: INSTANCES (3) for modern traffic, plus one pinned legacy instance.
+  // Must match INSTANCES in src/index.ts — every request, either protocol era,
+  // is load-balanced across this pool with no affinity.
   "containers": [
     {
       "class_name": "FastMCPContainer",
       "image": "./Dockerfile",
-      "max_instances": 4
+      "max_instances": 3
     }
   ],
 

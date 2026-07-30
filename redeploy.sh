@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bring the deployment back after a teardown, without redoing any dashboard work.
 #
-# Reads every value from .dev.vars (gitignored), pushes them as Worker secrets,
+# Reads every value from .deploy.vars (gitignored), pushes them as Worker secrets,
 # and deploys. Safe to re-run — `wrangler secret put` overwrites.
 #
 # This only recreates the CHEAP half: Worker, container, images, secrets.
@@ -12,10 +12,10 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-[ -f .dev.vars ] || { echo "no .dev.vars — copy .dev.vars.example and fill it in"; exit 1; }
-set -a; . ./.dev.vars; set +a
+[ -f .deploy.vars ] || { echo "no .deploy.vars — copy .deploy.vars.example and fill it in"; exit 1; }
+set -a; . ./.deploy.vars; set +a
 
-: "${REQUEST_STATE_KEY:?missing from .dev.vars}"
+: "${REQUEST_STATE_KEY:?missing from .deploy.vars}"
 
 echo "==> pushing secrets"
 printf '%s' "$REQUEST_STATE_KEY" | npx wrangler secret put REQUEST_STATE_KEY

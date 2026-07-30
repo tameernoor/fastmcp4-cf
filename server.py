@@ -253,4 +253,11 @@ if __name__ == "__main__":
         transport="http",
         host="0.0.0.0",  # noqa: S104 — inside a container, fronted by the Worker
         port=int(os.environ.get("PORT", "8080")),
+        # 2026-07-28 traffic is sessionless by definition, but a 2025-era
+        # client opens with `initialize` and expects an `Mcp-Session-Id` held
+        # in one process's memory — which no load balancer can honour. This
+        # serves legacy requests sessionlessly too (a fresh transport per
+        # request), so BOTH eras fan out across every instance and the Worker
+        # needs no era-aware routing. See NOTES.md.
+        stateless_http=True,
     )

@@ -1,0 +1,13 @@
+# Copy to `.deploy.vars` (gitignored) and fill in, then run ./redeploy.sh.
+# These are DEPLOY-time values, pushed as Worker secrets. Local development
+# uses .dev.vars instead — and generally wants auth OFF, so it holds only
+# REQUEST_STATE_KEY.
+
+# Required. At least 32 bytes:
+#   python -c "import secrets; print(secrets.token_hex(32))"
+REQUEST_STATE_KEY=""
+
+# Optional — Cloudflare Access. Omit both to deploy with NO authentication.
+ACCESS_TEAM_DOMAIN=""     # yourteam.cloudflareaccess.com
+ACCESS_AUD=""             # the Access application's AUD tag
+ADMIN_EMAILS=""           # comma-separated, may call admin-gated tools

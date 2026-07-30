@@ -11,6 +11,7 @@ node_modules/
 
 # Cloudflare Access service-token credentials, for non-interactive probing.
 .svc-token
+.deploy.vars
 
 __pycache__/
 *.py[cod]

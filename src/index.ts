@@ -67,41 +67,17 @@ export class FastMCPContainer extends Container<Env> {
 /** Fan out across this many instances so `whoami` visibly changes. */
 const INSTANCES = 3;
 
-/**
- * Where 2025-era traffic goes. One fixed instance, deliberately.
- *
- * A legacy client opens with `initialize` and gets an `Mcp-Session-Id` held in
- * ONE container's memory, then sends it on every later request. Fan that out
- * at random and ~(1 - 1/N) of its calls hit an instance that never saw the
- * session: `-32600 Session not found`, and the client reports the server as
- * having no tools.
- *
- * It cannot be fixed by hashing the session id either: `initialize` arrives
- * with no session at all, so the instance that mints the session is chosen
- * before there is anything to hash. Pinning the whole era to one instance is
- * the honest fix — legacy sessions were never load-balanceable without shared
- * session storage, which is exactly what 2026-07-28 set out to remove.
- */
-const LEGACY_INSTANCE = "instance-legacy";
-
-/**
- * Legacy clients send their own version here (`2025-11-25`), or omit the header
- * entirely (pre-2025-06-18). Only a modern client announces `2026-07-28`.
- * Header-only, so the request body is never consumed.
- */
-function isModern(request: Request): boolean {
-  return request.headers.get("mcp-protocol-version") === "2026-07-28";
-}
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Modern requests carry no session, so any instance can serve any of them —
-    // that is the whole point, and getRandom exercises it. Legacy traffic is
-    // pinned so its sessions survive. Both eras, one endpoint.
-    const instance = isModern(request)
-      ? await getRandom(env.MCP_CONTAINER, INSTANCES)
-      : env.MCP_CONTAINER.getByName(LEGACY_INSTANCE);
-
+    // No affinity, for either protocol era. 2026-07-28 is sessionless by
+    // design, and server.py runs with `stateless_http=True` so 2025-era
+    // requests are served without a session too — meaning every request here,
+    // old or new, can go to any instance.
+    //
+    // Without that flag this breaks: a legacy client's `initialize` mints an
+    // `Mcp-Session-Id` in one container's memory and its next request lands
+    // somewhere else. See NOTES.md.
+    const instance = await getRandom(env.MCP_CONTAINER, INSTANCES);
     return instance.fetch(withAccessIdentity(request));
   },
 } satisfies ExportedHandler<Env>;

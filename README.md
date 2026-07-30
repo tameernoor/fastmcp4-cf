@@ -76,6 +76,13 @@ npm install
 cp .dev.vars.example .dev.vars
 python -c "import secrets; print(secrets.token_hex(32))"   # paste into .dev.vars
 npm run dev                                                # ready on :8787
+```
+
+`.dev.vars` is local-dev config and deliberately holds no auth settings — you
+cannot mint a Cloudflare Access token on localhost, so adding them makes every
+local request `401`. Deploy-time values live in `.deploy.vars` instead.
+
+```bash
 
 ./probe.sh http://localhost:8787 server/discover
 ./probe.sh http://localhost:8787 tools/call whoami
@@ -137,7 +144,11 @@ Two constants are duplicated by necessity — keep them in sync:
 
 - port `8080`: `Dockerfile` (`EXPOSE`), `src/index.ts` (`defaultPort`), `server.py`
 - instance count: `src/index.ts` (`INSTANCES`) and `wrangler.jsonc`
-  (`max_instances`, which must also cover the pinned legacy instance)
+  (`max_instances`)
+
+`server.py` runs with `stateless_http=True`, which is what lets **both**
+protocol eras be load-balanced with no affinity. Turn it off and clients on the
+old protocol break intermittently — see [NOTES.md](NOTES.md).
 
 ## Authentication
 
