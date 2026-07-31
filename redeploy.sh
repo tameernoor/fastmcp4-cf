@@ -34,11 +34,19 @@ npm run deploy
 
 cat <<'EOF'
 
-Done. Two things to expect:
+Done. Two endpoints are live on the Worker:
+
+  * /mcp    the MCP endpoint
+  * /host   a browser host that drives the widget over 2026-07-28. It is a
+            plain route, so Access covers it only if Access covers the Worker.
+            Left open, it is a working console with a destructive button.
+
+Two things to expect:
 
   * first provisioning takes a few minutes before the container answers
   * running containers serve the previous image for several minutes after a
-    deploy — see NOTES.md, "A deploy is not a cutover"
+    deploy — see NOTES.md, "A deploy is not a cutover". The host page is
+    bundled into the Worker, so it updates immediately.
 
 If Access was left in place, the application reattaches by hostname and no
 dashboard work is needed.
