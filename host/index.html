@@ -180,18 +180,26 @@ const view = $("view");
 // inside has connected. Pushing a tool result before then silently drops it,
 // leaving an empty widget. Wait for the view to say it is listening.
 let viewReady;
-const viewIsReady = new Promise((resolve) => { viewReady = resolve; });
+let viewConnected = false;
+const viewIsReady = new Promise((resolve) => {
+  viewReady = () => { viewConnected = true; resolve(); };
+});
 
-// If the widget's script never loads (blocked CDN, offline, a bad pin) the
-// handshake never arrives. Without a deadline the boot await hangs forever and
-// the page sits there looking connected with nothing in the log.
-const viewIsReadyOrTimeout = Promise.race([
-  viewIsReady,
-  new Promise((resolve) => setTimeout(() => {
-    log("err", "view never sent ui/notifications/initialized");
-    resolve();
-  }, 5000)),
-]);
+// Deliberately NOT a deadline on the handshake. The view fetches a ~330 KB
+// bundle from a CDN and resolves a module graph before it can say hello, which
+// on a cold load is slower than any timeout worth setting. Racing it means
+// pushing the first result into a view that is not listening yet, and that
+// result is simply dropped.
+//
+// So the boot result is delivered whenever the view connects, and this timer
+// only complains — for the case that actually needs a signal, which is the
+// script never loading at all (blocked CDN, offline, an origin missing from
+// the resource's CSP).
+setTimeout(() => {
+  if (!viewConnected) {
+    log("err", "view has not connected — check the frame's CSP and console");
+  }
+}, 10000);
 
 function toView(message) {
   view.contentWindow?.postMessage(message, "*");
@@ -208,7 +216,10 @@ window.addEventListener("message", async (event) => {
 
   // Notifications from the view need no reply.
   if (msg.id === undefined) {
-    if (msg.method === "ui/notifications/initialized") viewReady();
+    if (msg.method === "ui/notifications/initialized") {
+      viewReady();
+      $("uiproto").textContent = UI_PROTOCOL;
+    }
     if (msg.method !== "ui/notifications/size-changed") log("in", msg.method);
     return;
   }
@@ -454,17 +465,15 @@ try {
     (doctype) => `${doctype}\n<meta http-equiv="Content-Security-Policy" content="${policy}">`,
   );
 
-  // The model's own call to the tool. Its result is pushed in, so the widget
-  // has data before anyone touches the refresh button. Both the call and the
-  // view's handshake are in flight at once, so wait for both.
-  const [first] = await Promise.all([
-    callTool(TOOL, {}),
-    viewIsReadyOrTimeout,
-  ]);
+  // The model's own call to the tool, so the widget has data before anyone
+  // touches refresh. Handed over when the view connects, however long that
+  // takes — the call and the handshake are independent.
+  //
   // The notification's params IS the CallToolResult. Wrapping it in an
   // envelope hands the view an object with no structuredContent, which it
   // then silently ignores.
-  notifyView("ui/notifications/tool-result", first);
+  const first = await callTool(TOOL, {});
+  viewIsReady.then(() => notifyView("ui/notifications/tool-result", first));
 
   $("session").textContent = sawSessionHeader ? "a session was minted" : "none, as expected";
   $("session").className = sawSessionHeader ? "bad" : "ok";
