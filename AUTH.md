@@ -9,6 +9,13 @@ Everything marked ✅ was verified directly against `fastmcp==4.0.0b1` /
 `mcp==2.0.0`. Everything else is from the spec or FastMCP's docs, linked at the
 bottom.
 
+> **Two surfaces, not one.** The Worker serves `/mcp` *and* `/host`, a browser
+> page that calls tools on your behalf — including a one-click `delete_notes`.
+> Access covers the whole Worker, so protecting `/mcp` protects `/host` too.
+> But if you expose this without Access, you have published a working admin
+> console, not just an API. `/host` is a plain route, so it is not excluded by
+> anything you configure for `/mcp`.
+
 ---
 
 ## Option 0 — Cloudflare Access (what this template wires up)

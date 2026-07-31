@@ -5,6 +5,10 @@
   "compatibility_date": "2026-07-01",
   "observability": { "enabled": true },
 
+  // Lets src/index.ts import host/index.html as a string, so the host page is
+  // served from this Worker rather than a separate origin needing CORS.
+  "rules": [{ "type": "Text", "globs": ["**/*.html"], "fallthrough": false }],
+
   // ACCESS_TEAM_DOMAIN and ACCESS_AUD are deliberately NOT here — they point
   // at one specific Zero Trust org, so a committed value would send every
   // clone at someone else's account. Set them per-deployment instead:
