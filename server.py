@@ -6,22 +6,31 @@ it fans requests across several container instances at random. Because the
 2026-07-28 protocol carries no session, any instance can answer any request:
 call `whoami` repeatedly and watch the instance id change under you.
 
-Two tools, each demonstrating one half of the new protocol:
+Three tools, each demonstrating one part of the new protocol:
   whoami        stateless dispatch — no session, so no affinity needed
+  monitor       an MCP App — a tool that renders as an interactive widget
   delete_notes  a guard tool — the multi-round-trip replacement for elicitation
 """
 
 import json
 import os
+import resource
+import time
 import uuid
 
 import mcp.types as mt
 from fastmcp import Context, FastMCP
+from fastmcp.apps import AppConfig, ResourceCSP, app_config_to_meta_dict
 from fastmcp.tools import InputRequiredToolResult
 from mcp.server.request_state import RequestStateSecurity
 
 INSTANCE = f"{os.uname().nodename}-{uuid.uuid4().hex[:6]}"
+BOOTED_AT = time.monotonic()
 _calls_served = 0
+
+# MCP Apps (io.modelcontextprotocol/ui) is a negotiated extension, not core, so
+# `monitor` must stay useful as plain text. The widget is an enhancement.
+MONITOR_URI = "ui://fastmcp4-cf/monitor.html"
 
 # A guard tool's `request_state` is sealed on the way out and verified on the
 # way back. FastMCP's default is RequestStateSecurity.ephemeral() — a key
@@ -179,6 +188,327 @@ def whoami() -> str:
         },
         indent=2,
     )
+
+
+def _rss_mb() -> float:
+    """Current resident memory of this process, in MiB.
+
+    `ru_maxrss` is only the high-water mark, so a live gauge built on it never
+    falls. It's the off-Linux fallback: kilobytes on Linux, bytes on macOS.
+    """
+    try:
+        with open("/proc/self/statm") as f:
+            resident_pages = int(f.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        raw = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return raw / 1024 if os.uname().sysname == "Linux" else raw / (1024 * 1024)
+
+
+def _mem_total_mb() -> float | None:
+    """Total memory visible to this container, or None off Linux."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    return None
+
+
+def _cgroup(name: str) -> str | None:
+    """Read a cgroup v2 file, or None if it isn't there (macOS, cgroup v1)."""
+    try:
+        with open(f"/sys/fs/cgroup/{name}") as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def _container_stats() -> dict[str, object]:
+    """What this container is actually using and allowed to use.
+
+    cgroup v2 is the only per-container source: /proc lies about cpus and load.
+    A limit reads "max" when uncapped, which is what local Docker gives you —
+    a deployed instance has real numbers here.
+    """
+    used = _cgroup("memory.current")
+    limit = _cgroup("memory.max")
+    pids = _cgroup("pids.current")
+
+    cpu_seconds = None
+    for line in (_cgroup("cpu.stat") or "").splitlines():
+        if line.startswith("usage_usec"):
+            cpu_seconds = round(int(line.split()[1]) / 1_000_000, 2)
+
+    cpu_limit = None
+    quota, _, period = (_cgroup("cpu.max") or "").partition(" ")
+    if quota.isdigit() and period.isdigit():
+        cpu_limit = round(int(quota) / int(period), 2)
+
+    return {
+        # Falls back to this process's RSS so the no-Docker loop still shows
+        # something; cgroup counts the whole container, which is bigger.
+        "memory_used_mb": round(int(used) / (1024 * 1024), 1)
+        if used and used.isdigit()
+        else round(_rss_mb(), 1),
+        "memory_limit_mb": round(int(limit) / (1024 * 1024), 1)
+        if limit and limit.isdigit()
+        else None,
+        "cpu_seconds": cpu_seconds,
+        "cpu_limit": cpu_limit,
+        "processes": int(pids) if pids and pids.isdigit() else None,
+    }
+
+
+@mcp.tool(app=AppConfig(resource_uri=MONITOR_URI, visibility=["model", "app"]))
+def monitor() -> dict[str, object]:
+    """Live vitals for the container instance that served this call.
+
+    Renders as a dashboard on hosts that support MCP Apps.
+    """
+    global _calls_served
+    _calls_served += 1
+
+    # `host` is grouped apart because it is NOT per-container: /proc/loadavg
+    # is not namespaced and os.cpu_count() ignores cgroup limits, so both read
+    # identical on every instance. Don't build per-container gauges from them.
+    load1, load5, load15 = os.getloadavg()
+    return {
+        "instance": INSTANCE,
+        "uptime_s": round(time.monotonic() - BOOTED_AT, 1),
+        "calls_served": _calls_served,
+        "container": _container_stats(),
+        "host": {
+            "cpu_count": os.cpu_count(),
+            "load": {"1m": round(load1, 2), "5m": round(load5, 2), "15m": round(load15, 2)},
+            "memory_total_mb": _mem_total_mb(),
+        },
+    }
+
+
+# The HTML the host drops into a sandboxed iframe — exactly what
+# `resources/read` returns for MONITOR_URI.
+MONITOR_HTML = """<!DOCTYPE html>
+<meta name="color-scheme" content="light dark">
+<style>
+  :root {
+    --bg: transparent; --fg: #16181d; --dim: #6b7280;
+    --line: #e5e7eb; --card: #ffffff; --accent: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e8eaed; --dim: #9aa0a6;
+      --line: #2c2f36; --card: #16181d; --accent: #7aa2f7;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--fg);
+    font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 16px; max-width: 560px;
+  }
+  header { display: flex; align-items: baseline; gap: 8px; margin-bottom: 14px; }
+  h1 { font-size: 14px; font-weight: 600; margin: 0; }
+  .chip {
+    font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+    padding: 4px 7px; border-radius: 999px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    color: var(--accent);
+  }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 12px; margin-bottom: 16px;
+  }
+  .stat .k { font-size: 11px; color: var(--dim); text-transform: uppercase;
+             letter-spacing: .04em; }
+  .stat .v { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .stat .v small { font-size: 12px; font-weight: 400; color: var(--dim); }
+  h2 { font-size: 11px; color: var(--dim); text-transform: uppercase;
+       letter-spacing: .04em; margin: 0 0 8px; font-weight: 500; }
+  #hist { display: flex; align-items: flex-end; gap: 3px; height: 44px; }
+  #hist i { flex: 1; min-width: 4px; border-radius: 2px 2px 0 0; opacity: .85; }
+  #legend { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px;
+            font: 11px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: var(--dim); }
+  #legend b { font-weight: 400; }
+  #legend span { display: inline-block; width: 8px; height: 8px;
+                 border-radius: 2px; margin-right: 5px; }
+  footer { display: flex; align-items: center; justify-content: space-between;
+           margin-top: 16px; gap: 12px; }
+  button {
+    font: inherit; font-weight: 500; padding: 7px 13px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 8px;
+    background: var(--card); color: var(--fg);
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: default; }
+  #note { font-size: 12px; color: var(--dim); }
+</style>
+
+<div class="card">
+  <header>
+    <h1>container vitals</h1>
+    <span class="chip" id="instance">—</span>
+  </header>
+
+  <div class="grid">
+    <div class="stat">
+      <div class="k">uptime</div>
+      <div class="v" id="uptime">—</div>
+    </div>
+    <div class="stat">
+      <div class="k">calls served</div>
+      <div class="v" id="calls">—</div>
+    </div>
+    <div class="stat">
+      <div class="k">memory</div>
+      <div class="v"><span id="mem">—</span><small id="memlimit"></small></div>
+    </div>
+    <div class="stat">
+      <div class="k">cpu used</div>
+      <div class="v"><span id="cpu">—</span><small id="cpulimit"></small></div>
+    </div>
+    <div class="stat">
+      <div class="k">processes</div>
+      <div class="v" id="procs">—</div>
+    </div>
+    <div class="stat">
+      <div class="k">host load 1m</div>
+      <div class="v"><span id="load">—</span><small id="cores"></small></div>
+      <div class="k" style="text-transform:none;letter-spacing:0">shared, not per container</div>
+    </div>
+  </div>
+
+  <h2>calls served, per refresh — colour is the container that answered</h2>
+  <div id="hist"></div>
+  <div id="legend"></div>
+
+  <footer>
+    <span id="note">one container so far</span>
+    <button id="refresh">refresh</button>
+  </footer>
+</div>
+
+<script type="module">
+// Pinned deliberately. Loading `@latest` would mean the widget silently
+// changes under you, and the origin below must match `csp.resourceDomains`.
+import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@1.7.5/app-with-deps";
+
+// Every refresh appends here, so the chart is a record of successive
+// host-mediated calls rather than a poll of one machine.
+const history = [];
+const seen = new Map();
+const PALETTE = ["#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0891b2"];
+
+const $ = (id) => document.getElementById(id);
+
+function colourFor(instance) {
+  if (!seen.has(instance)) seen.set(instance, PALETTE[seen.size % PALETTE.length]);
+  return seen.get(instance);
+}
+
+function render(stats) {
+  if (!stats) return;
+  const colour = colourFor(stats.instance);
+  history.push(stats);
+  if (history.length > 40) history.shift();
+
+  $("instance").textContent = stats.instance;
+  $("instance").style.color = colour;
+  $("uptime").textContent = stats.uptime_s < 90
+    ? `${Math.round(stats.uptime_s)}s`
+    : `${Math.floor(stats.uptime_s / 60)}m`;
+  $("calls").textContent = stats.calls_served;
+
+  const c = stats.container;
+  $("mem").textContent = `${Math.round(c.memory_used_mb)} MiB`;
+  $("memlimit").textContent = c.memory_limit_mb
+    ? ` / ${Math.round(c.memory_limit_mb)}`
+    : " / uncapped";
+  $("cpu").textContent = c.cpu_seconds === null ? "—" : `${c.cpu_seconds.toFixed(1)}s`;
+  $("cpulimit").textContent = c.cpu_limit ? ` / ${c.cpu_limit} cpu` : " / uncapped";
+  $("procs").textContent = c.processes ?? "—";
+
+  $("load").textContent = stats.host.load["1m"].toFixed(2);
+  $("cores").textContent = ` / ${stats.host.cpu_count} cpu`;
+
+  // calls_served, NOT host load: load is the machine's and reads identical on
+  // every container, so bar heights would carry no information at all. Each
+  // container counts only its own calls, so the staircases interleave.
+  const peak = Math.max(1, ...history.map((h) => h.calls_served));
+  $("hist").replaceChildren(...history.map((h) => {
+    const bar = document.createElement("i");
+    bar.style.height = `${Math.max(6, (h.calls_served / peak) * 100)}%`;
+    bar.style.background = colourFor(h.instance);
+    bar.title = `${h.instance} · call #${h.calls_served}`;
+    return bar;
+  }));
+
+  // textContent, not innerHTML: `id` comes off the wire, and a template that
+  // interpolates server data into markup teaches the wrong reflex.
+  $("legend").replaceChildren(...[...seen].map(([id, c]) => {
+    const el = document.createElement("b");
+    const swatch = document.createElement("span");
+    swatch.style.background = c;
+    el.append(swatch, id);
+    return el;
+  }));
+
+  $("note").textContent = seen.size === 1
+    ? "one container so far — keep refreshing"
+    : `${seen.size} containers have answered, no session between them`;
+}
+
+const app = new App({ name: "fastmcp4-cf monitor", version: "1.0.0" });
+
+// The host pushes the result of the model's own call to `monitor` in here,
+// so the widget is populated before anyone touches the button.
+app.ontoolresult = (result) => render(result.structuredContent);
+app.onerror = console.error;
+
+$("refresh").addEventListener("click", async () => {
+  const button = $("refresh");
+  button.disabled = true;
+  try {
+    // NOT a request to the server. The host performs the call on our behalf,
+    // and records it in the conversation so the model knows it happened.
+    const result = await app.callServerTool({ name: "monitor", arguments: {} });
+    // A tool that fails resolves normally with isError — only transport
+    // failures reject — so this needs checking, not just a try/catch.
+    if (result.isError) throw new Error("tool returned an error");
+    render(result.structuredContent);
+  } catch (e) {
+    console.error(e);
+    $("note").textContent = "call failed — see console";
+  } finally {
+    button.disabled = false;
+  }
+});
+
+await app.connect();
+</script>
+"""
+
+
+# `ui://` infers `text/html;profile=mcp-app`, so no mime_type needed. The host
+# builds the iframe's CSP from `resourceDomains` and blocks anything missing —
+# drop unpkg.com and the widget's script silently never loads.
+@mcp.resource(
+    MONITOR_URI,
+    meta={
+        "ui": app_config_to_meta_dict(
+            AppConfig(csp=ResourceCSP(resource_domains=["https://unpkg.com"]))
+        )
+    },
+)
+def monitor_ui() -> str:
+    """The dashboard `monitor` renders in."""
+    return MONITOR_HTML
 
 
 @mcp.tool(auth=is_admin)

@@ -6,6 +6,22 @@ stateless protocol, on Cloudflare Containers behind a Worker.
 
 Clone it, add tools, deploy.
 
+## What it exercises
+
+| feature | here |
+| --- | --- |
+| No sessions, no `initialize` | any instance answers any request |
+| `server/discover` | replaces the handshake, cacheable |
+| `resultType` on every result | `complete` / `input_required` |
+| MRTR with sealed `requestState` | `delete_notes` |
+| `ttlMs` + `cacheScope` hints | every list result |
+| Deterministic `tools/list` order | prompt-cache friendly |
+| Extension negotiation | `capabilities.extensions` |
+| MCP Apps (`io.modelcontextprotocol/ui`) | `monitor` and its `ui://` resource |
+| Declared sandbox CSP | the resource's `_meta.ui.csp` |
+| Load balancing, scale-to-zero | Worker `getRandom`, `sleepAfter` |
+| Edge OAuth + per-caller authz | Cloudflare Access, admin-gated tool |
+
 ## Why this exists
 
 MCP 2026-07-28 is the largest revision since the protocol launched. It **removes
@@ -14,10 +30,20 @@ request carries its own protocol version and client identity in a `_meta`
 envelope, so any instance can answer any request — which is what makes
 round-robin load balancing and scale-to-zero possible at all.
 
+The core also got *smaller*. Server-initiated requests are gone, replaced by
+MRTR. Roots, sampling, logging and dynamic client registration are **deprecated**
+rather than removed — still functional for a twelve-month window, but not for new
+code. Tasks moved out into a separately-versioned **extension** you negotiate,
+which is now the pattern for anything beyond the core.
+
 This is a working place to watch that happen:
 
 - **`whoami`** reports which container answered, and who the server thinks you
   are. Call it repeatedly — the instance changes mid-conversation, nothing pinned.
+- **`monitor`** is an **MCP App**: a tool bound to a `ui://` resource that the
+  host renders as an interactive widget. Its refresh button makes the host call
+  the tool again, so each refresh may be answered by a different container —
+  visible in the chart, since the colour is whichever one replied.
 - **`delete_notes`** is a guard tool: the multi-round-trip replacement for
   `ctx.elicit()`, which now raises on modern connections. It also demonstrates
   per-caller authorization.
@@ -66,6 +92,9 @@ instance handles it.
 - **Docker running** — wrangler builds the image locally
 - **Workers Paid plan** — Containers are not on the free tier
 - Node 20+
+- **Python 3.12+** if you want the no-Docker loop below. FastMCP 4 has no wheel
+  for the Python 3.9 that ships with macOS, and `pip install --pre` there fails
+  with a misleading *"no matching distribution found"*.
 
 ## Run locally
 
@@ -101,8 +130,8 @@ just iterating on tool code. To run the MCP server on its own — no container,
 no Worker, no load balancing, but the same protocol:
 
 ```bash
-python -m venv .venv && . .venv/bin/activate
-pip install --pre -r requirements.txt
+uv venv --python 3.12 .venv                    # or: python3.12 -m venv .venv
+uv pip install --prerelease=allow -r requirements.txt
 
 REQUEST_STATE_KEY=$(python -c "import secrets; print(secrets.token_hex(32))") \
   PORT=9000 python server.py
@@ -132,6 +161,55 @@ STATE=$(./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"not
 The tool body runs from the top on **both** rounds — locals don't survive.
 `ctx.input_responses` is `None` the first time, populated the second; anything
 else that must carry over goes in `request_state`.
+
+### An interactive widget
+
+`monitor` renders as HTML in a sandboxed iframe instead of printing as text —
+the [`io.modelcontextprotocol/ui`](https://modelcontextprotocol.io/seps/1865-mcp-apps-interactive-user-interfaces-for-mcp)
+extension. It is negotiated, not core, so `monitor` returns a plain dict and
+hosts without it just show the numbers.
+
+A tool points at a resource, and the resource is the HTML:
+
+```python
+@mcp.tool(app=AppConfig(resource_uri=MONITOR_URI, visibility=["model", "app"]))
+def monitor() -> dict[str, object]:
+    ...
+
+@mcp.resource(MONITOR_URI, meta={"ui": app_config_to_meta_dict(
+    AppConfig(csp=ResourceCSP(resource_domains=["https://unpkg.com"])))})
+def monitor_ui() -> str:
+    return MONITOR_HTML
+```
+
+`ui://` infers `text/html;profile=mcp-app`. The host renders that HTML in a
+sandboxed iframe: scripts boxed off from the rest of the app, and a CSP built
+from the origins you declared. **Declare every external one** — anything missing
+is blocked, so a forgotten entry means a blank panel and no error.
+
+To see it, FastMCP ships a local host with a tool picker and a JSON-RPC log:
+
+```bash
+uv pip install --prerelease=allow 'fastmcp[apps]'   # dev-only; NOT in the image
+fastmcp dev apps server.py
+```
+
+That runs **one** Python process, so the instance never changes and the chart
+stays one colour. To watch the load balancer, point the same UI at the Worker
+instead — `fastmcp run` accepts a URL, and each proxied call is a separate
+request:
+
+```bash
+npm run dev                                  # note the port it prints
+fastmcp dev apps http://localhost:8787/mcp
+```
+
+Refresh repeatedly and `calls served` jumps between unrelated numbers, because
+each container counts only its own. The button never talks to this server: it
+asks the *host* to call the tool, which is why the model sees that you clicked.
+
+`fastmcp[apps]` is only needed for the preview — `AppConfig` is core FastMCP,
+so the image installs plain `requirements.txt`.
 
 ## Deploy
 
