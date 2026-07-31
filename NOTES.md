@@ -98,6 +98,28 @@ what is measured above is how badly it degrades in practice.
 
 ---
 
+## The app preview runs one process
+
+**Symptom:** an MCP App built to show instances changing shows one instance,
+forever. Load balancing looks broken.
+
+`fastmcp dev apps server.py` starts a single Python server and points the
+browser at it. There is only one instance to answer.
+
+**Fix:** `fastmcp run` accepts a URL, so aim the dev host at the Worker instead
+of letting it boot a server. Each proxied call is then its own request, fanned
+out by `getRandom`:
+
+```bash
+npm run dev
+fastmcp dev apps http://localhost:8787/mcp
+```
+
+Measured: 8 refreshes, all 3 containers answered, each with its own
+`calls_served`.
+
+---
+
 ## A deploy is not a cutover
 
 **Symptom:** you change Python, deploy, test immediately, and conclude your

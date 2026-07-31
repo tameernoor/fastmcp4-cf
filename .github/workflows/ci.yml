@@ -100,38 +100,78 @@ jobs:
           print('  round-trip $i ok')"
           done
 
-      # Regression test for the dual-era routing bug. A 2025-era client gets a
-      # session held in ONE container's memory; if the Worker fans its later
-      # requests across the pool, most of them come back `-32600 Session not
-      # found` and the client reports the server as having no tools.
-      - name: Legacy session survives repeated requests
+      # Regression test for the dual-era routing bug. A 2025-era client used to
+      # get a session held in ONE container's memory; fanning its later requests
+      # across the pool returned `-32600 Session not found` for most of them, and
+      # the client reported the server as having no tools. `stateless_http=True`
+      # removes the session altogether, which is what lets legacy traffic be
+      # load-balanced at all — so assert both halves of that: no session is
+      # minted, and repeated sessionless requests keep working anyway.
+      - name: Legacy traffic is served without a session
         run: |
           set -euo pipefail
           URL=http://localhost:8787/mcp
-          SID=$(curl -sS -D /tmp/legacy-headers.txt -o /dev/null -X POST $URL \
+          curl -sS -D /tmp/legacy-headers.txt -o /dev/null -X POST $URL \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -H 'MCP-Protocol-Version: 2025-11-25' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"1.0"}}}'
-            grep -i "mcp-session-id" /tmp/legacy-headers.txt | tr -d '\r' | awk '{print $2}')
-          test -n "$SID" || { echo "no session id issued"; exit 1; }
-          echo "session: $SID"
+          if grep -qi "mcp-session-id" /tmp/legacy-headers.txt; then
+            echo "a session WAS minted — stateless_http is off, and legacy"
+            echo "clients will break intermittently behind the load balancer"
+            exit 1
+          fi
+          echo "ok: legacy initialize minted no session"
           for i in $(seq 1 8); do
             curl -sS -X POST $URL \
               -H 'Content-Type: application/json' \
               -H 'Accept: application/json, text/event-stream' \
               -H 'MCP-Protocol-Version: 2025-11-25' \
-              -H "Mcp-Session-Id: $SID" \
               -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' \
               | python -c "
           import sys, json
           raw = sys.stdin.read()
           lines = [l for l in raw.splitlines() if l.startswith('data: ')]
           d = json.loads(lines[0][6:]) if lines else json.loads(raw)
-          assert 'error' not in d, 'legacy session broke: ' + d['error']['message']
+          assert 'error' not in d, 'legacy request failed: ' + d['error']['message']
           assert d['result']['tools'], 'no tools returned'
           print('  legacy tools/list $i ok —', [t['name'] for t in d['result']['tools']])"
           done
+
+      # The MCP Apps extension is negotiated, so the wire metadata is the
+      # contract: a UI-bound tool must carry _meta.ui.resourceUri, and the
+      # resource it names must exist with the app profile MIME type.
+      - name: monitor advertises its ui:// resource
+        run: |
+          set -euo pipefail
+          ./probe.sh http://localhost:8787 tools/list \
+            | python -c "
+          import json, sys
+          tools = {t['name']: t for t in json.load(sys.stdin)['result']['tools']}
+          ui = tools['monitor']['_meta']['ui']
+          assert ui['resourceUri'] == 'ui://fastmcp4-cf/monitor.html', ui
+          print('ok: monitor ->', ui['resourceUri'])"
+          ./probe.sh http://localhost:8787 resources/list \
+            | python -c "
+          import json, sys
+          res = {r['uri']: r for r in json.load(sys.stdin)['result']['resources']}
+          app = res['ui://fastmcp4-cf/monitor.html']
+          assert app['mimeType'] == 'text/html;profile=mcp-app', app['mimeType']
+          domains = app['_meta']['ui']['csp']['resourceDomains']
+          assert 'https://unpkg.com' in domains, domains
+          print('ok: resource', app['mimeType'], domains)"
+
+      - name: monitor degrades to text for non-Apps clients
+        run: |
+          set -euo pipefail
+          ./probe.sh http://localhost:8787 tools/call monitor \
+            | python -c "
+          import json, sys
+          r = json.load(sys.stdin)['result']
+          assert r['resultType'] == 'complete', r
+          body = json.loads(r['content'][0]['text'])
+          assert body['instance'] and body['calls_served'] >= 1, body
+          print('ok: readable without the extension —', body['instance'])"
 
       - name: Tampered request_state is rejected
         run: |
