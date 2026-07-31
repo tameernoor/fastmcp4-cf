@@ -53,7 +53,7 @@
   <div class="card row" id="status" role="status">
     <span><b>connection</b> <span id="conn">connecting…</span></span>
     <span><b>protocol</b> <span id="proto">—</span></span>
-    <span><b>ui dialect</b> <span id="uiproto">—</span></span>
+    <span><b>apps protocol</b> <span id="uiproto">—</span></span>
     <span><b>session</b> <span id="session">—</span></span>
   </div>
 
@@ -84,7 +84,10 @@
 // is still on the 2025 line. Requests mirror probe.sh exactly.
 // ---------------------------------------------------------------------------
 const MCP_PROTOCOL = "2026-07-28";
-const UI_PROTOCOL = "2026-01-26";   // the MCP Apps dialect, versioned separately
+// The MCP Apps protocol, versioned separately from MCP itself. Two protocols
+// on this page: MCP over HTTP to the server, MCP Apps over postMessage to the
+// iframe. Independent version numbers, which is what being an extension means.
+const UI_PROTOCOL = "2026-01-26";
 const UI_MIME = "text/html;profile=mcp-app";
 const ENDPOINT = new URL("/mcp", location.origin).href;
 
@@ -231,7 +234,6 @@ window.addEventListener("message", async (event) => {
   try {
     switch (msg.method) {
       case "ui/initialize":
-        $("uiproto").textContent = UI_PROTOCOL;
         log("in", "ui/initialize");
         reply({
           protocolVersion: UI_PROTOCOL,
