@@ -89,28 +89,69 @@ instance handles it.
 
 ## Prerequisites
 
-- **Docker running** — wrangler builds the image locally
-- **Workers Paid plan** — Containers are not on the free tier
-- Node 20+
-- **Python 3.12+** if you want the no-Docker loop below. FastMCP 4 has no wheel
-  for the Python 3.9 that ships with macOS, and `pip install --pre` there fails
-  with a misleading *"no matching distribution found"*.
+**To run locally:** Python 3.12+. FastMCP 4 has no wheel for the 3.9 that ships
+with macOS, where the install fails with a misleading *"no matching distribution
+found"*. Node 20+ and Docker running only if you want the Worker and several
+containers.
+
+**To deploy:** the above, plus a **Workers Paid plan** — Containers are not on
+the free tier.
 
 ## Run locally
 
-No Cloudflare account needed — the container runs in local Docker.
+No Cloudflare account needed.
+
+### 1. The tools — no Docker
+
+```bash
+git clone https://github.com/tameernoor/fastmcp4-cf && cd fastmcp4-cf
+uv venv --python 3.12 .venv                    # or: python3.12 -m venv .venv
+uv pip install --prerelease=allow -r requirements.txt
+
+REQUEST_STATE_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))") \
+  PORT=9000 .venv/bin/python server.py
+```
+
+In another shell:
+
+```bash
+./probe.sh http://localhost:9000 server/discover
+./probe.sh http://localhost:9000 tools/call monitor
+```
+
+`server/discover` replaced the `initialize` handshake — it returns
+`supportedVersions`, `resultType`, `instructions`, and cache hints.
+
+### 2. Plus the widget in a browser
+
+```bash
+uv pip install --prerelease=allow 'fastmcp[apps]'   # dev-only; NOT in the image
+.venv/bin/fastmcp dev apps server.py
+```
+
+A tool picker, a real host bridge, and a JSON-RPC log panel. One process, so the
+instance never changes — for that you want the Worker.
+
+### 3. The Worker and three containers — needs Docker
 
 ```bash
 npm install
 cp .dev.vars.example .dev.vars
-python -c "import secrets; print(secrets.token_hex(32))"   # paste into .dev.vars
-npm run dev                                                # ready on :8787
+python3 -c "import secrets; print(secrets.token_hex(32))"   # paste into .dev.vars
+npm run dev                                                 # :8787 by default
 ```
 
-Then, in another shell:
+Point the preview at the Worker instead of letting it boot its own server —
+`fastmcp run` accepts a URL, and each proxied call is a separate request:
 
 ```bash
-./probe.sh http://localhost:8787 server/discover
+.venv/bin/fastmcp dev apps http://localhost:8787/mcp
+```
+
+Refresh the widget repeatedly and a different container answers each time.
+`probe.sh` works against the Worker too:
+
+```bash
 ./probe.sh http://localhost:8787 tools/call whoami
 ```
 
@@ -118,43 +159,19 @@ Then, in another shell:
 cannot mint a Cloudflare Access token on localhost, so adding them makes every
 local request `401`. Deploy-time values live in `.deploy.vars` instead.
 
-`server/discover` replaced the `initialize` handshake — it returns
-`supportedVersions`, `resultType`, `instructions`, and cache hints. Call
-`whoami` a few times and watch `instance` change: several containers answering
-one client, no session between them.
-
-### Faster loop: no Docker, no Worker
-
-`wrangler dev` rebuilds the image on every start, which is slow when you are
-just iterating on tool code. To run the MCP server on its own — no container,
-no Worker, no load balancing, but the same protocol:
-
-```bash
-uv venv --python 3.12 .venv                    # or: python3.12 -m venv .venv
-uv pip install --prerelease=allow -r requirements.txt
-
-REQUEST_STATE_KEY=$(python -c "import secrets; print(secrets.token_hex(32))") \
-  PORT=9000 python server.py
-
-./probe.sh http://localhost:9000 tools/call whoami
-```
-
-Use `wrangler dev` when you care about the Worker, the routing, or anything
-Cloudflare-shaped; use this when you are writing tools.
-
 ### The server asking a question back
 
 `delete_notes` returns a question instead of blocking on one:
 
 ```bash
 # Round 1 — the server asks. Note resultType: "input_required".
-./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"notes"}'
+./probe.sh http://localhost:9000 tools/call delete_notes '{"folder":"notes"}'
 
 # Round 2 — retry the SAME call with the answer and the state.
-STATE=$(./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"notes"}' \
+STATE=$(./probe.sh http://localhost:9000 tools/call delete_notes '{"folder":"notes"}' \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['result']['requestState'])")
 
-./probe.sh http://localhost:8787 tools/call delete_notes '{"folder":"notes"}' \
+./probe.sh http://localhost:9000 tools/call delete_notes '{"folder":"notes"}' \
   '{"confirm":{"action":"accept","content":{"value":true}}}' "$STATE"
 ```
 
@@ -187,28 +204,12 @@ sandboxed iframe: scripts boxed off from the rest of the app, and a CSP built
 from the origins you declared. **Declare every external one** — anything missing
 is blocked, so a forgotten entry means a blank panel and no error.
 
-To see it, FastMCP ships a local host with a tool picker and a JSON-RPC log:
+Refresh it repeatedly and `calls served` jumps between unrelated numbers,
+because each container counts only its own. The button never talks to this
+server: it asks the *host* to call the tool, which is why the model sees that
+you clicked. Run it with [step 2 or 3](#2-plus-the-widget-in-a-browser) above.
 
-```bash
-uv pip install --prerelease=allow 'fastmcp[apps]'   # dev-only; NOT in the image
-fastmcp dev apps server.py
-```
-
-That runs **one** Python process, so the instance never changes and the chart
-stays one colour. To watch the load balancer, point the same UI at the Worker
-instead — `fastmcp run` accepts a URL, and each proxied call is a separate
-request:
-
-```bash
-npm run dev                                  # note the port it prints
-fastmcp dev apps http://localhost:8787/mcp
-```
-
-Refresh repeatedly and `calls served` jumps between unrelated numbers, because
-each container counts only its own. The button never talks to this server: it
-asks the *host* to call the tool, which is why the model sees that you clicked.
-
-`fastmcp[apps]` is only needed for the preview — `AppConfig` is core FastMCP,
+`fastmcp[apps]` is only needed for that preview — `AppConfig` is core FastMCP,
 so the image installs plain `requirements.txt`.
 
 ## Deploy
