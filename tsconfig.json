@@ -1,0 +1,18 @@
+{
+  // `wrangler deploy --dry-run` bundles with esbuild, which strips types
+  // without checking them. Without this file nothing type-checks the Worker at
+  // all, and src/html.d.ts is decorative. `npm run typecheck` is the check.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["@cloudflare/workers-types"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -15,6 +15,7 @@ Three tools, each demonstrating one part of the new protocol:
 import json
 import os
 import resource
+import socket
 import time
 import uuid
 
@@ -226,6 +227,19 @@ def _cgroup(name: str) -> str | None:
         return None
 
 
+def _ip() -> str | None:
+    """This container's address on the network.
+
+    Genuinely per-container, unlike /proc/sys/kernel/random/boot_id, which
+    looks like a machine identifier and is identical across every container
+    because they share the host kernel.
+    """
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        return None
+
+
 def _container_stats() -> dict[str, object]:
     """What this container is actually using and allowed to use.
 
@@ -248,6 +262,7 @@ def _container_stats() -> dict[str, object]:
         cpu_limit = round(int(quota) / int(period), 2)
 
     return {
+        "ip": _ip(),
         # Falls back to this process's RSS so the no-Docker loop still shows
         # something; cgroup counts the whole container, which is bigger.
         "memory_used_mb": round(int(used) / (1024 * 1024), 1)
@@ -362,8 +377,8 @@ MONITOR_HTML = """<!DOCTYPE html>
       <div class="v" id="uptime">—</div>
     </div>
     <div class="stat">
-      <div class="k">calls served</div>
-      <div class="v" id="calls">—</div>
+      <div class="k">ip</div>
+      <div class="v" id="ip" style="font-size:15px">—</div>
     </div>
     <div class="stat">
       <div class="k">memory</div>
@@ -384,7 +399,7 @@ MONITOR_HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <h2>calls served, per refresh — colour is the container that answered</h2>
+  <h2>your refreshes, in order — colour is the container that answered</h2>
   <div id="hist"></div>
   <div id="legend"></div>
 
@@ -403,6 +418,7 @@ import { App } from "https://unpkg.com/@modelcontextprotocol/ext-apps@1.7.5/app-
 // host-mediated calls rather than a poll of one machine.
 const history = [];
 const seen = new Map();
+const tally = new Map();   // this page's own count, so it always matches your clicks
 const PALETTE = ["#2563eb", "#16a34a", "#ea580c", "#9333ea", "#0891b2"];
 
 const $ = (id) => document.getElementById(id);
@@ -423,9 +439,13 @@ function render(stats) {
   $("uptime").textContent = stats.uptime_s < 90
     ? `${Math.round(stats.uptime_s)}s`
     : `${Math.floor(stats.uptime_s / 60)}m`;
-  $("calls").textContent = stats.calls_served;
+  // Counted here, not read off the server. The server's own counter includes
+  // every other client that ever called it, which makes it look wrong the
+  // first time a container appears already above 1.
+  tally.set(stats.instance, (tally.get(stats.instance) ?? 0) + 1);
 
   const c = stats.container;
+  $("ip").textContent = c.ip ?? "—";
   $("mem").textContent = `${Math.round(c.memory_used_mb)} MiB`;
   $("memlimit").textContent = c.memory_limit_mb
     ? ` / ${Math.round(c.memory_limit_mb)}`
@@ -437,15 +457,13 @@ function render(stats) {
   $("load").textContent = stats.host.load["1m"].toFixed(2);
   $("cores").textContent = ` / ${stats.host.cpu_count} cpu`;
 
-  // calls_served, NOT host load: load is the machine's and reads identical on
-  // every container, so bar heights would carry no information at all. Each
-  // container counts only its own calls, so the staircases interleave.
-  const peak = Math.max(1, ...history.map((h) => h.calls_served));
+  // One bar per refresh, in order, coloured by whoever answered it. Equal
+  // height: the interesting thing is the sequence of colours, not a magnitude.
   $("hist").replaceChildren(...history.map((h) => {
     const bar = document.createElement("i");
-    bar.style.height = `${Math.max(6, (h.calls_served / peak) * 100)}%`;
+    bar.style.height = "100%";
     bar.style.background = colourFor(h.instance);
-    bar.title = `${h.instance} · call #${h.calls_served}`;
+    bar.title = h.instance;
     return bar;
   }));
 
@@ -455,7 +473,7 @@ function render(stats) {
     const el = document.createElement("b");
     const swatch = document.createElement("span");
     swatch.style.background = c;
-    el.append(swatch, id);
+    el.append(swatch, `${id} · ${tally.get(id) ?? 0}`);
     return el;
   }));
 

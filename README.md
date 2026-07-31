@@ -18,7 +18,8 @@ Clone it, add tools, deploy.
 | Deterministic `tools/list` order | prompt-cache friendly |
 | Extension negotiation | `capabilities.extensions` |
 | MCP Apps (`io.modelcontextprotocol/ui`) | `monitor` and its `ui://` resource |
-| Declared sandbox CSP | the resource's `_meta.ui.csp` |
+| Declared sandbox CSP | enforced by `host/` on the widget's iframe |
+| A host that speaks it | `host/`, served at `/host` |
 | Load balancing, scale-to-zero | Worker `getRandom`, `sleepAfter` |
 | Edge OAuth + per-caller authz | Cloudflare Access, admin-gated tool |
 
@@ -81,7 +82,8 @@ instance handles it.
 | --- | --- |
 | `server.py` | the MCP server — put your tools here |
 | `Dockerfile` | `linux/amd64` image, required by Containers |
-| `src/index.ts` | the Worker: routing, secrets, protocol-era handling |
+| `src/index.ts` | the Worker: routing, secrets, serves `/host` |
+| `host/index.html` | a host that drives the widget over 2026-07-28 |
 | `wrangler.jsonc` | container, Durable Object binding, migration |
 | `probe.sh` | smoke tool — raw 2026-07-28 over curl |
 | [`AUTH.md`](AUTH.md) | **read before exposing this** — authn/authz |
@@ -141,19 +143,29 @@ python3 -c "import secrets; print(secrets.token_hex(32))"   # paste into .dev.va
 npm run dev                                                 # :8787 by default
 ```
 
-Point the preview at the Worker instead of letting it boot its own server —
-`fastmcp run` accepts a URL, and each proxied call is a separate request:
+That serves two things on the same origin:
+
+| | |
+| --- | --- |
+| `/mcp` | the MCP endpoint |
+| **`/host`** | a host page that drives the widget over **2026-07-28** |
+
+Open **http://localhost:8787/host**. Refresh the widget repeatedly and a
+different container answers each time. `probe.sh` works against the Worker too:
+
+```bash
+./probe.sh http://localhost:8787 tools/call whoami
+```
+
+To drive the widget from FastMCP's preview instead, point it at the Worker
+rather than letting it boot its own server — `fastmcp run` accepts a URL:
 
 ```bash
 .venv/bin/fastmcp dev apps http://localhost:8787/mcp
 ```
 
-Refresh the widget repeatedly and a different container answers each time.
-`probe.sh` works against the Worker too:
-
-```bash
-./probe.sh http://localhost:8787 tools/call whoami
-```
+Note that preview connects on **2025-11-25**, not 2026-07-28. See
+[`host/`](#the-host) below for why.
 
 `.dev.vars` is local-dev config and deliberately holds no auth settings — you
 cannot mint a Cloudflare Access token on localhost, so adding them makes every
@@ -204,13 +216,44 @@ sandboxed iframe: scripts boxed off from the rest of the app, and a CSP built
 from the origins you declared. **Declare every external one** — anything missing
 is blocked, so a forgotten entry means a blank panel and no error.
 
-Refresh it repeatedly and `calls served` jumps between unrelated numbers,
-because each container counts only its own. The button never talks to this
-server: it asks the *host* to call the tool, which is why the model sees that
-you clicked. Run it with [step 2 or 3](#2-plus-the-widget-in-a-browser) above.
+The refresh button never talks to this server. It asks the *host* to call the
+tool, which is why the model sees that you clicked.
+Run it with [step 2 or 3](#2-plus-the-widget-in-a-browser) above.
 
-`fastmcp[apps]` is only needed for that preview — `AppConfig` is core FastMCP,
-so the image installs plain `requirements.txt`.
+`fastmcp[apps]` is only needed for FastMCP's preview — `AppConfig` is core
+FastMCP, so the image installs plain `requirements.txt`.
+
+## The host
+
+Nothing shipping today drives an MCP App over 2026-07-28. `ext-apps@1.7.5`
+peer-depends on `@modelcontextprotocol/sdk ^1.29.0`, and that line's
+`LATEST_PROTOCOL_VERSION` is still `2025-11-25` even at 1.30.0 — so FastMCP's
+preview, and every other MCP Apps host, connects on the old protocol. A v2 SDK
+exists (`@modelcontextprotocol/client@2.0.0`); ext-apps has no 2.x line.
+
+So [`host/index.html`](host/index.html) is a minimal host that does. The Worker
+serves it at **`/host`**, same origin as `/mcp`, which is the only reason it
+needs no CORS. Around 200 lines, no dependencies, no build step:
+
+- **The MCP leg is hand-written `fetch`**, mirroring `probe.sh`. Using an SDK
+  would hide the thing being demonstrated, and no JS SDK speaks this yet anyway.
+  Four calls, none of them `initialize`, no session.
+- **The view leg is the `ui/*` dialect over postMessage**, which is plain
+  JSON-RPC with no envelope. The widget is an unmodified ext-apps `App` and
+  cannot tell the other side is speaking a newer protocol.
+- **It enforces the resource's CSP.** Building the iframe policy from
+  `_meta.ui.csp` is the host's job; ignore it and the widget runs unrestricted.
+- **It gates on `_meta.ui.visibility`.** Only tools marked `"app"` may be
+  invoked from the widget, so an app cannot reach your whole tool surface.
+- **It answers the server's questions.** `delete_notes` returns
+  `input_required`, the page renders it, and retries the same call with
+  `inputResponses` and the sealed `requestState`. FastMCP's preview has no
+  handling for this at all.
+
+The iframe runs with `sandbox="allow-scripts"` and no `allow-same-origin`:
+`srcdoc` inherits the parent origin, so keeping that flag would leave the widget
+same-origin with the host, able to read its DOM and call `/mcp` with your
+session.
 
 ## Deploy
 
@@ -226,9 +269,20 @@ First provisioning takes a few minutes. Then:
 ./probe.sh https://fastmcp4-cf.<your-subdomain>.workers.dev tools/call whoami
 ```
 
+The host page deploys with the Worker, at
+`https://fastmcp4-cf.<your-subdomain>.workers.dev/host`. It is a plain route,
+not a static asset binding, so there is nothing extra to provision — but it is
+also **public unless you put Access in front of it**, and it carries a
+one-click destructive control. See [Authentication](#authentication).
+
 `REQUEST_STATE_KEY` seals the multi-round-trip `request_state`. **Every instance
 needs the same value** — see [NOTES.md](NOTES.md) for why the default breaks
 under a load balancer. The server refuses to boot without it.
+
+Python changes need a container restart, not just a deploy — running containers
+keep serving the previous image for several minutes. [NOTES.md](NOTES.md) covers
+that. The host page is different: it is bundled into the Worker, so it updates
+the moment `wrangler deploy` finishes.
 
 ## Adding your own tools
 
@@ -249,10 +303,19 @@ Two constants are duplicated by necessity — keep them in sync:
 protocol eras be load-balanced with no affinity. Turn it off and clients on the
 old protocol break intermittently — see [NOTES.md](NOTES.md).
 
+Before pushing:
+
+```bash
+npm run typecheck    # tsc --noEmit; `npm run check` bundles but does NOT check
+npm run check        # wrangler deploy --dry-run
+```
+
 ## Authentication
 
 **Off by default** — as cloned, anyone with the URL can call every tool, and the
-server says so on boot.
+server says so on boot. That includes `/host`, which is a working console with a
+destructive button on it, so deploying this open publishes rather more than an
+API. Access covers the whole Worker, `/mcp` and `/host` alike.
 
 **Cloudflare Access** is wired up and needs no code: Access runs the OAuth flow
 at the edge and forwards a signed JWT, which `server.py` verifies.

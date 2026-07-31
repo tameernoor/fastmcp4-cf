@@ -98,6 +98,30 @@ what is measured above is how badly it degrades in practice.
 
 ---
 
+## An undeclared origin blanks the widget, silently
+
+**Symptom:** an MCP App renders as an empty panel. No error anywhere. Every MCP
+call succeeded.
+
+A `ui://` resource declares the origins it needs in `_meta.ui.csp`, and the
+**host** turns that into the iframe's Content-Security-Policy. Miss one and the
+browser blocks it, which the server never hears about and the host does not log.
+
+Measured: dropping `https://unpkg.com` from
+`ResourceCSP(resource_domains=[...])` blanks the panel, because that is where
+the widget loads the ext-apps client. `server/discover`, `tools/list`,
+`resources/read` and `tools/call` all still returned normally.
+
+The only signal is the view never sending `ui/notifications/initialized`.
+`host/index.html` puts a five second deadline on that and logs it, otherwise the
+page sits there looking connected forever.
+
+Note this is the host's job, not the server's. A host that reads
+`contents[0].text` and ignores `_meta` gives the widget no policy at all, and
+the declaration becomes decoration.
+
+---
+
 ## The app preview runs one process
 
 **Symptom:** an MCP App built to show instances changing shows one instance,

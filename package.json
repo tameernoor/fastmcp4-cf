@@ -8,12 +8,15 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "check": "wrangler deploy --dry-run",
+    "typecheck": "tsc --noEmit",
     "tail": "wrangler tail"
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260731.1",
+    "typescript": "^7.0.2",
     "wrangler": "^4.115.0"
   }
 }

@@ -18,6 +18,14 @@ jobs:
         run: python -m py_compile server.py
       - name: Shellcheck probe.sh
         run: shellcheck probe.sh
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci
+      # `wrangler deploy --dry-run` in the build job bundles but does not
+      # type-check, so without this the Worker is never checked at all.
+      - name: Typecheck the Worker
+        run: npm run typecheck
 
   build:
     runs-on: ubuntu-latest

@@ -10,6 +10,10 @@
  */
 
 import { Container, getRandom } from "@cloudflare/containers";
+// Bundled at build time so the page is served from this Worker, same origin as
+// /mcp. That is the whole reason it lives here: a host page on another origin
+// would need CORS on every MCP response.
+import HOST_PAGE from "../host/index.html";
 
 interface Env {
   MCP_CONTAINER: DurableObjectNamespace<FastMCPContainer>;
@@ -69,6 +73,15 @@ const INSTANCES = 3;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // A minimal host that drives the MCP Apps widget over 2026-07-28. The
+    // ext-apps AppBridge cannot yet: it is pinned to the 1.x JS SDK, whose
+    // newest protocol is 2025-11-25. See NOTES.md.
+    if (new URL(request.url).pathname === "/host") {
+      return new Response(HOST_PAGE, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
     // No affinity, for either protocol era. 2026-07-28 is sessionless by
     // design, and server.py runs with `stateless_http=True` so 2025-era
     // requests are served without a session too — meaning every request here,

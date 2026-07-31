@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<title>fastmcp4-cf host</title>
+<meta name="color-scheme" content="light dark">
+<style>
+  :root { --fg:#16181d; --dim:#6b7280; --line:#e5e7eb; --card:#fff; --accent:#2563eb; --bad:#dc2626; }
+  @media (prefers-color-scheme: dark) {
+    :root { --fg:#e8eaed; --dim:#9aa0a6; --line:#2c2f36; --card:#16181d; --accent:#7aa2f7; --bad:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:24px; color:var(--fg);
+         font:14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  .wrap { max-width: 900px; margin: 0 auto; display: grid; gap: 16px; }
+  h1 { font-size:15px; margin:0; font-weight:600; }
+  .sub { color:var(--dim); font-size:12px; margin-top:2px; }
+  .card { border:1px solid var(--line); border-radius:12px; background:var(--card); padding:14px 16px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:baseline;
+         font:12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .row b { font-weight:500; color:var(--dim); }
+  .ok { color:var(--accent); }
+  .bad { color:var(--bad); }
+  iframe { width:100%; border:0; border-radius:12px; background:transparent; min-height:340px; }
+  button { font:inherit; font-weight:500; padding:7px 13px; cursor:pointer;
+           border:1px solid var(--line); border-radius:8px; background:var(--card); color:var(--fg); }
+  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  #mrtr { display:flex; flex-wrap:wrap; gap:10px; align-items:center; }
+  #prompt { color:var(--dim); }
+  #folder { font:inherit; padding:6px 10px; width:140px; color:var(--fg);
+            border:1px solid var(--line); border-radius:8px; background:transparent; }
+  #question { flex:1 1 100%; margin-bottom:2px; }
+  #state { flex:1 1 100%; color:var(--dim);
+           font:11px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+           word-break:break-all; }
+  #log { font:11px/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
+         max-height:260px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  #log div { padding:1px 0; border-bottom:1px solid var(--line); }
+  #log .out { color:var(--accent); }
+  #log .in  { color:var(--dim); }
+  #log .err { color:var(--bad); }
+</style>
+
+<div class="wrap">
+  <div>
+    <h1>fastmcp4-cf host</h1>
+    <div class="sub">
+      A minimal MCP host that speaks 2026-07-28 over plain fetch. No SDK, no
+      initialize, no session. It renders the server's ui:// resource and
+      forwards the widget's tool calls.
+    </div>
+  </div>
+
+  <div class="card row" id="status" role="status">
+    <span><b>connection</b> <span id="conn">connecting…</span></span>
+    <span><b>protocol</b> <span id="proto">—</span></span>
+    <span><b>ui dialect</b> <span id="uiproto">—</span></span>
+    <span><b>session</b> <span id="session">—</span></span>
+  </div>
+
+  <!-- No allow-same-origin: srcdoc inherits the parent origin, and keeping it
+       would leave the widget same-origin with this page, able to reach the DOM
+       and call /mcp with your session. An opaque origin is the whole sandbox. -->
+  <iframe id="view" title="tool widget" sandbox="allow-scripts"></iframe>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:10px">
+      multi round-trip. Ask for something destructive and the server answers
+      with a question instead of doing it. This page collects your answer and
+      retries the same call.
+    </div>
+    <div id="mrtr"></div>
+  </div>
+
+  <div class="card">
+    <div class="sub" style="margin-bottom:8px">wire log</div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script type="module">
+// ---------------------------------------------------------------------------
+// The MCP leg. Deliberately hand written: the point of this page is to prove a
+// widget can be driven over 2026-07-28, and the JS SDK that ext-apps depends on
+// is still on the 2025 line. Requests mirror probe.sh exactly.
+// ---------------------------------------------------------------------------
+const MCP_PROTOCOL = "2026-07-28";
+const UI_PROTOCOL = "2026-01-26";   // the MCP Apps dialect, versioned separately
+const UI_MIME = "text/html;profile=mcp-app";
+const ENDPOINT = new URL("/mcp", location.origin).href;
+
+const $ = (id) => document.getElementById(id);
+let sawSessionHeader = false;
+
+function log(dir, text) {
+  const el = document.createElement("div");
+  el.className = dir;
+  const arrow = dir === "out" ? "→" : dir === "in" ? "←" : "!";
+  el.textContent = `${arrow} ${text}`;
+  $("log").prepend(el);
+}
+
+async function rpc(method, params = {}, name) {
+  const body = {
+    jsonrpc: "2.0",
+    id: Math.floor(Math.random() * 1e9),
+    method,
+    params: {
+      ...params,
+      // Every request carries its own version and identity. This is what
+      // replaced the handshake, and what lets any instance answer.
+      _meta: {
+        "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL,
+        "io.modelcontextprotocol/clientInfo": { name: "fastmcp4-cf-host", version: "0.1.0" },
+        // Declaring the extension we actually use. A server that branches on
+        // it (FastMCP exposes client_supports_extension) would otherwise hand
+        // us the text-only fallback and the widget would never appear.
+        "io.modelcontextprotocol/clientCapabilities": {
+          extensions: { "io.modelcontextprotocol/ui": {} },
+        },
+      },
+    },
+  };
+
+  // Mcp-Name must match what the body targets, or the server rejects the
+  // request with -32020 HeaderMismatch. For tools/call that is the tool name,
+  // for resources/read it is the uri.
+  const headers = {
+    "Content-Type": "application/json",
+    "Accept": "application/json, text/event-stream",
+    "MCP-Protocol-Version": MCP_PROTOCOL,
+    "Mcp-Method": method,
+  };
+  const target = name ?? params.uri;
+  if (target) headers["Mcp-Name"] = target;
+
+  log("out", `${method}${name ? " " + name : ""}`);
+  const res = await fetch(ENDPOINT, { method: "POST", headers, body: JSON.stringify(body) });
+
+  // If a session were ever minted we would want to know, loudly.
+  if (res.headers.get("mcp-session-id")) sawSessionHeader = true;
+
+  if (!res.ok) throw new Error(`${method} — HTTP ${res.status}`);
+
+  // The response may share the stream with notifications, which are written
+  // BEFORE it. Taking the first `data:` frame would pick a notification and
+  // return undefined, so match on our own request id instead.
+  const raw = await res.text();
+  const frames = raw.startsWith("data: ") || raw.includes("\ndata: ")
+    ? raw.split("\n").filter((l) => l.startsWith("data: ")).map((l) => l.slice(6))
+    : [raw];
+
+  let payload;
+  for (const frame of frames) {
+    try {
+      const parsed = JSON.parse(frame);
+      if (parsed.id === body.id) { payload = parsed; break; }
+    } catch { /* a continuation line, or not ours */ }
+  }
+  if (!payload) throw new Error(`${method} — no response for id ${body.id}`);
+
+  if (payload.error) {
+    const err = new Error(payload.error.message);
+    err.code = payload.error.code;
+    err.data = payload.error.data;
+    log("err", `${method} ${payload.error.code} ${payload.error.message}`);
+    throw err;
+  }
+  log("in", `${method} ${payload.result?.resultType ?? "ok"}`);
+  return payload.result;
+}
+
+// ---------------------------------------------------------------------------
+// The view leg. Plain JSON-RPC over postMessage, which is all the ui/* dialect
+// is. The widget inside the iframe is an ordinary ext-apps App and cannot tell
+// that the other side of this bridge is talking a newer protocol.
+// ---------------------------------------------------------------------------
+const view = $("view");
+
+// The iframe's `load` event fires when the document parses, NOT when the App
+// inside has connected. Pushing a tool result before then silently drops it,
+// leaving an empty widget. Wait for the view to say it is listening.
+let viewReady;
+const viewIsReady = new Promise((resolve) => { viewReady = resolve; });
+
+// If the widget's script never loads (blocked CDN, offline, a bad pin) the
+// handshake never arrives. Without a deadline the boot await hangs forever and
+// the page sits there looking connected with nothing in the log.
+const viewIsReadyOrTimeout = Promise.race([
+  viewIsReady,
+  new Promise((resolve) => setTimeout(() => {
+    log("err", "view never sent ui/notifications/initialized");
+    resolve();
+  }, 5000)),
+]);
+
+function toView(message) {
+  view.contentWindow?.postMessage(message, "*");
+}
+
+function notifyView(method, params) {
+  toView({ jsonrpc: "2.0", method, params });
+}
+
+window.addEventListener("message", async (event) => {
+  if (event.source !== view.contentWindow) return;
+  const msg = event.data;
+  if (msg?.jsonrpc !== "2.0") return;
+
+  // Notifications from the view need no reply.
+  if (msg.id === undefined) {
+    if (msg.method === "ui/notifications/initialized") viewReady();
+    if (msg.method !== "ui/notifications/size-changed") log("in", msg.method);
+    return;
+  }
+
+  const reply = (result) => toView({ jsonrpc: "2.0", id: msg.id, result });
+  const fail = (message) =>
+    toView({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message } });
+
+  try {
+    switch (msg.method) {
+      case "ui/initialize":
+        $("uiproto").textContent = UI_PROTOCOL;
+        log("in", "ui/initialize");
+        reply({
+          protocolVersion: UI_PROTOCOL,
+          // `serverTools` is the real key. `tools: {call:{}}` is not in the
+          // schema, so zod strips it and any widget that feature-detects
+          // before enabling its buttons sees a host with no capabilities.
+          hostCapabilities: { serverTools: {} },
+          hostInfo: { name: "fastmcp4-cf-host", version: "0.1.0" },
+          hostContext: {
+            theme: matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light",
+          },
+        });
+        break;
+
+      case "ping":
+        reply({});
+        break;
+
+      // The whole point. The widget asks US to call the tool, and we do it
+      // over 2026-07-28. The widget never touches the server.
+      //
+      // Gated on visibility: `_meta.ui.visibility` is how a server says which
+      // tools an app may invoke, and an app is less trusted than the model.
+      // Without this check the widget inherits your entire tool surface.
+      case "tools/call": {
+        const declared = tools.get(msg.params.name);
+        if (!declared?._meta?.ui?.visibility?.includes("app")) {
+          fail(`${msg.params.name} is not app-visible`);
+          break;
+        }
+        reply(await callTool(msg.params.name, msg.params.arguments ?? {}, askInPanel));
+        break;
+      }
+
+      default:
+        fail(`unsupported: ${msg.method}`);
+    }
+  } catch (e) {
+    fail(String(e.message ?? e));
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Multi round-trip. 2026-07-28 removed server-initiated requests, so a tool
+// that needs an answer RETURNS the question as `resultType: "input_required"`
+// and the client retries the SAME call carrying `inputResponses` plus the
+// server's sealed `requestState`. Gathering that answer is the host's job,
+// which is why this lives here and not in the widget.
+//
+// Every tool call in this page goes through callTool, so the retry loop is
+// written once and no caller has to know whether a tool asks questions.
+// ---------------------------------------------------------------------------
+const mrtr = $("mrtr");
+
+/**
+ * Call a tool, answering any questions it returns, until it completes.
+ *
+ * `ask` receives the InputRequiredResult and resolves with the `inputResponses`
+ * to retry with. Omit it and a question becomes an error, which is what a
+ * caller with no way to prompt should do.
+ */
+async function callTool(name, args, ask) {
+  let result = await rpc("tools/call", { name, arguments: args }, name);
+
+  // A loop, not an if: nothing says a tool may only ask once.
+  while (result.resultType === "input_required") {
+    if (!ask) throw new Error(`${name} asked for input, and nothing here can answer`);
+    const inputResponses = await ask(result);
+    result = await rpc("tools/call", {
+      name,
+      arguments: args,
+      // Round two is a retry of the SAME call. There is no session, so the
+      // answers and the server's sealed state travel with it.
+      inputResponses,
+      requestState: result.requestState,
+    }, name);
+  }
+  return result;
+}
+
+function resetMrtr() {
+  const folder = document.createElement("input");
+  folder.id = "folder";
+  folder.value = "notes";
+  folder.setAttribute("aria-label", "folder to delete");
+  mrtr.replaceChildren(
+    say("delete every note in folder", "prompt"),
+    folder,
+    button("delete", () => askDeleteNotes(folder.value || "notes")),
+  );
+}
+
+function button(label, onClick) {
+  const b = document.createElement("button");
+  b.textContent = label;
+  // Disable while in flight rather than {once:true}: a failed attempt must
+  // stay retryable, and a click that starts a network call needs feedback.
+  b.addEventListener("click", async () => {
+    b.disabled = true;
+    b.setAttribute("aria-busy", "true");
+    try {
+      await onClick();
+    } catch (e) {
+      mrtr.replaceChildren(say(String(e.message ?? e)));
+      setTimeout(resetMrtr, 4000);
+    } finally {
+      b.disabled = false;
+      b.removeAttribute("aria-busy");
+    }
+  });
+  return b;
+}
+
+function say(text, id) {
+  const el = document.createElement("div");
+  if (id) el.id = id;
+  el.textContent = text;
+  return el;
+}
+
+function finish(text) {
+  mrtr.replaceChildren(say(text));
+  setTimeout(resetMrtr, 4000);
+}
+
+/**
+ * Render an InputRequiredResult in the panel and resolve with the answers.
+ *
+ * Driven by what the server sent: its own key for the request, its own message.
+ * The two buttons cover a boolean confirmation, which is what `requestedSchema`
+ * describes here. A general host would build the form from that schema.
+ */
+function askInPanel(result) {
+  // `inputRequests` is optional and its keys are the server's to choose, so
+  // take the first rather than assuming one called "confirm".
+  const [key, request] = Object.entries(result.inputRequests ?? {})[0] ?? [];
+  if (!key) throw new Error("server asked for input but sent no inputRequests");
+
+  return new Promise((resolve) => {
+    const answer = (action, value) => resolve({ [key]: { action, content: { value } } });
+
+    const question = say(request.params.message, "question");
+    question.tabIndex = -1;
+    mrtr.replaceChildren(
+      question,
+      button("yes, delete", () => answer("accept", true)),
+      button("cancel", () => answer("decline", false)),
+      // Shown because it is the whole trick: the server keeps nothing between
+      // rounds, so everything it needs rides along sealed in here.
+      say(`requestState ${result.requestState?.slice(0, 48) ?? "none"}…`, "state"),
+    );
+    question.focus();   // the button that was activated is gone; move focus on
+  });
+}
+
+async function askDeleteNotes(folder) {
+  // Admin-gated, so a refusal here is a legitimate outcome, not a failure.
+  // Errors propagate to button()'s handler, which resets the panel.
+  const done = await callTool("delete_notes", { folder }, askInPanel);
+  finish(done.content?.[0]?.text ?? "done");
+}
+
+// ---------------------------------------------------------------------------
+// Boot: discover, find the UI-bound tool, load its resource, call it once, and
+// hand the first result to the widget the way a real host would.
+// ---------------------------------------------------------------------------
+const TOOL = new URLSearchParams(location.search).get("tool") ?? "monitor";
+
+/**
+ * Turn a resource's declared `_meta.ui.csp` into a policy for its frame.
+ *
+ * Enforcing this is the HOST's job. The server only declares what the app
+ * needs; if the host ignores the declaration, as this page did at first, the
+ * widget runs with no restrictions at all and the declaration is decoration.
+ * Anything undeclared defaults to 'none' rather than being left open.
+ */
+function policyFor(meta) {
+  const csp = meta?.ui?.csp ?? {};
+  // `'none'` is only meaningful alone. Browsers ignore it when other sources
+  // are present, so building "'unsafe-inline' 'none'" would read as a lockdown
+  // and enforce nothing.
+  const src = (domains, ...always) => {
+    const sources = [...always, ...(domains ?? [])];
+    return sources.length ? sources.join(" ") : "'none'";
+  };
+  return [
+    "default-src 'none'",
+    // The widget's own script and styles are inline, so these are unavoidable.
+    `script-src ${src(csp.resourceDomains, "'unsafe-inline'")}`,
+    "style-src 'unsafe-inline'",
+    `img-src ${src(csp.resourceDomains, "data:")}`,
+    `font-src ${src(csp.resourceDomains)}`,
+    `connect-src ${src(csp.connectDomains)}`,
+    `frame-src ${src(csp.frameDomains)}`,
+    `base-uri ${src(csp.baseUriDomains)}`,
+  ].join("; ");
+}
+
+resetMrtr();
+
+// Populated at boot, read by the view bridge to decide what the widget may call.
+const tools = new Map();
+
+try {
+  const discover = await rpc("server/discover");
+  $("conn").textContent = "connected";
+  $("conn").className = "ok";
+  $("proto").textContent = discover.supportedVersions.join(", ");
+  if (!discover.supportedVersions.includes(MCP_PROTOCOL)) {
+    log("err", `server does not speak ${MCP_PROTOCOL}`);
+  }
+
+  for (const t of (await rpc("tools/list")).tools) tools.set(t.name, t);
+  const tool = tools.get(TOOL);
+  if (!tool) throw new Error(`no tool named ${TOOL}`);
+
+  const uri = tool._meta?.ui?.resourceUri;
+  if (!uri) throw new Error(`${TOOL} has no _meta.ui.resourceUri`);
+
+  const resource = await rpc("resources/read", { uri });
+  const content = resource.contents?.[0];
+  if (typeof content?.text !== "string") throw new Error(`${uri} returned no text`);
+  if (content.mimeType !== UI_MIME) throw new Error(`${uri} is ${content.mimeType}`);
+
+  // The policy has to be inside the document, because a srcdoc frame has no
+  // response of its own to carry a header.
+  const policy = policyFor(content._meta);
+  log("out", `frame csp ${policy.slice(0, 60)}…`);
+  view.srcdoc = content.text.replace(
+    /<!DOCTYPE[^>]*>/i,
+    (doctype) => `${doctype}\n<meta http-equiv="Content-Security-Policy" content="${policy}">`,
+  );
+
+  // The model's own call to the tool. Its result is pushed in, so the widget
+  // has data before anyone touches the refresh button. Both the call and the
+  // view's handshake are in flight at once, so wait for both.
+  const [first] = await Promise.all([
+    callTool(TOOL, {}),
+    viewIsReadyOrTimeout,
+  ]);
+  // The notification's params IS the CallToolResult. Wrapping it in an
+  // envelope hands the view an object with no structuredContent, which it
+  // then silently ignores.
+  notifyView("ui/notifications/tool-result", first);
+
+  $("session").textContent = sawSessionHeader ? "a session was minted" : "none, as expected";
+  $("session").className = sawSessionHeader ? "bad" : "ok";
+} catch (e) {
+  // textContent, not innerHTML: `e.message` carries the ?tool= query value and
+  // any server-supplied error string, both attacker controlled.
+  $("conn").textContent = String(e.message ?? e);
+  $("conn").className = "bad";
+  log("err", String(e.message ?? e));
+}
+</script>
