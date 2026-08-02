@@ -24,6 +24,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.apps import AppConfig, ResourceCSP, app_config_to_meta_dict
 from fastmcp.tools import InputRequiredToolResult
 from mcp.server.request_state import RequestStateSecurity
+from starlette.middleware import Middleware
 
 INSTANCE = f"{os.uname().nodename}-{uuid.uuid4().hex[:6]}"
 BOOTED_AT = time.monotonic()
@@ -55,6 +56,123 @@ if len(REQUEST_STATE_KEY) < 32:
         "the load balancer needs the SAME value or guard tools break on retry."
     )
 
+# --- request limits ----------------------------------------------------------
+# MCP requests are small. Nothing here legitimately sends a megabyte or nests
+# sixty levels deep, and both are cheap ways to burn a container's CPU.
+MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", str(256 * 1024)))
+MAX_JSON_DEPTH = int(os.environ.get("MAX_JSON_DEPTH", "64"))
+
+
+def _too_deep(raw: bytes, limit: int) -> bool:
+    """Whether the JSON nests deeper than `limit`, without parsing it.
+
+    Scanning the bytes rather than calling json.loads is the point: parsing is
+    the expensive step being defended against, so this counts brackets and
+    never builds the object. Quoted strings are skipped so braces inside them
+    do not count.
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for byte in raw:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif byte == 0x5C:  # backslash
+                escaped = True
+            elif byte == 0x22:  # closing quote
+                in_string = False
+            continue
+        if byte == 0x22:
+            in_string = True
+        elif byte in (0x7B, 0x5B):  # { [
+            depth += 1
+            if depth > limit:
+                return True
+        elif byte in (0x7D, 0x5D):  # } ]
+            depth -= 1
+    return False
+
+
+class RequestLimits:
+    """Reject oversized or pathologically nested bodies before they are parsed.
+
+    Plain ASGI rather than Starlette's BaseHTTPMiddleware: that class buffers
+    the response through an anyio stream, which breaks the SSE responses this
+    server returns. This one only inspects the request and otherwise gets out
+    of the way.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+
+        declared = dict(scope.get("headers") or {}).get(b"content-length")
+        if declared and int(declared) > MAX_BODY_BYTES:
+            await _reject(send, 413, "request body too large")
+            return
+
+        # Content-Length can lie, or be absent under chunked encoding, so the
+        # body is read and measured rather than trusted.
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message["type"] != "http.request":
+                break
+            chunk = message.get("body", b"")
+            total += len(chunk)
+            if total > MAX_BODY_BYTES:
+                await _reject(send, 413, "request body too large")
+                return
+            chunks.append(chunk)
+            if not message.get("more_body"):
+                break
+
+        body = b"".join(chunks)
+        if _too_deep(body, MAX_JSON_DEPTH):
+            await _reject(send, 400, "json nested too deeply")
+            return
+
+        # Hand the body we already consumed to the app underneath, then get out
+        # of the way. Later calls must fall through to the real receive, not
+        # fake a disconnect: the transport treats one as the client vanishing
+        # and abandons the response without sending anything.
+        replayed = False
+
+        async def replay():
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {"type": "http.request", "body": body, "more_body": False}
+            return await receive()
+
+        await self.app(scope, replay, send)
+
+
+async def _reject(send, status: int, message: str) -> None:
+    payload = json.dumps({"error": message}).encode()
+    await send({
+        "type": "http.response.start",
+        "status": status,
+        "headers": [
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(payload)).encode()),
+        ],
+    })
+    await send({"type": "http.response.body", "body": payload})
+
+
+# Running without auth has to be a decision, not an accident. Unset the Access
+# variables and the server refuses to boot unless this is explicitly set — the
+# same discipline REQUEST_STATE_KEY already gets.
+OPEN_MODE = os.environ.get("ALLOW_OPEN_MODE", "").strip() == "1"
+
+
 def build_auth():
     """Verify Cloudflare Access identity, when running behind Access.
 
@@ -62,18 +180,28 @@ def build_auth():
     the Worker moves it into `Authorization: Bearer` so all this side has to do
     is verify the signature, issuer, and audience against Access's JWKS. There
     is no OAuth flow in this process.
-
-    Both variables unset = no auth at all. That is fine for a demo and wrong
-    for anything else, so it says so loudly.
     """
     team_domain = os.environ.get("ACCESS_TEAM_DOMAIN", "").strip()
     aud = os.environ.get("ACCESS_AUD", "").strip()
 
     if not (team_domain and aud):
+        if not OPEN_MODE:
+            raise SystemExit(
+                "No authentication configured, and ALLOW_OPEN_MODE is not set.\n"
+                "\n"
+                "Unset, ACCESS_TEAM_DOMAIN and ACCESS_AUD mean anyone with the\n"
+                "URL can call every tool, including the admin-gated ones. That\n"
+                "is a reasonable thing to want locally and a bad thing to do by\n"
+                "accident, so it has to be asked for.\n"
+                "\n"
+                "  require auth:  set ACCESS_TEAM_DOMAIN and ACCESS_AUD (AUTH.md)\n"
+                "  boot open:     set ALLOW_OPEN_MODE=1 (local dev and demos)\n"
+            )
         print(
-            "WARNING: no authentication — anyone with the URL can call every "
-            "tool. Set ACCESS_TEAM_DOMAIN and ACCESS_AUD to require Cloudflare "
-            "Access. See AUTH.md.",
+            "WARNING: ALLOW_OPEN_MODE — no authentication. Anyone with the URL "
+            "can call every tool, including monitor and delete_notes. Set "
+            "ACCESS_TEAM_DOMAIN and ACCESS_AUD to require Cloudflare Access. "
+            "See AUTH.md.",
             flush=True,
         )
         return None
@@ -110,12 +238,34 @@ def is_admin_email(email: str | None) -> bool:
     return bool(email) and email.lower() in ADMIN_EMAILS
 
 
+# How long a guard tool's question stays answerable. Long enough for a human
+# to read it, short enough that a leaked state blob is not useful later.
+STATE_TTL_SECONDS = int(os.environ.get("STATE_TTL_SECONDS", "300"))
+
+
+def _caller_sub() -> str:
+    """Stable identity of the current caller, for binding request_state to.
+
+    Without this, a sealed blob minted for one caller is a valid answer from
+    any other. In open mode there are no identities, so everyone is the same
+    "anonymous" and the binding is a no-op — which is what open mode means.
+    """
+    if AUTH is None:
+        return "anonymous"
+    from fastmcp.server.dependencies import get_access_token
+
+    token = get_access_token()
+    claims = (token.claims or {}) if token else {}
+    return str(claims.get("sub") or claims.get("common_name") or "unknown")
+
+
 def is_admin(ctx) -> bool:
     """True for callers listed in ADMIN_EMAILS.
 
-    With no authentication configured there are no identities to tell apart,
-    so this passes — otherwise the demo would hide its own guard tool. The
-    server has already warned, loudly, that it is wide open in that mode.
+    Fail-closed by default: no authentication means no identities to tell
+    apart, so nobody is an admin. The one exception is ALLOW_OPEN_MODE, which
+    is an explicit statement that this server is open — without it the process
+    would not have booted at all.
 
     Note a service token can never satisfy this: its JWT carries `common_name`,
     not `email`. That is a feature — machine credentials should not inherit a
@@ -123,7 +273,7 @@ def is_admin(ctx) -> bool:
     only the ungated tools. Authorize on `common_name` if you want otherwise.
     """
     if AUTH is None:
-        return True
+        return OPEN_MODE
     if ctx.token is None:
         return False
     return is_admin_email(ctx.token.claims.get("email"))
@@ -177,9 +327,12 @@ def whoami() -> str:
                 "common_name": claims.get("common_name"),
                 "sub": claims.get("sub"),
                 "is_admin": is_admin_email(claims.get("email")),
-                # Everything else, so you can see what your IdP actually sends.
-                "all_claim_keys": sorted(claims),
             }
+            # What your IdP actually sends, which is genuinely useful when
+            # wiring one up and has no business being echoed to every caller.
+            # A tool that reflects token internals is a bad habit to copy.
+            if is_admin_email(claims.get("email")):
+                caller["all_claim_keys"] = sorted(claims)
 
     return json.dumps(
         {
@@ -277,11 +430,17 @@ def _container_stats() -> dict[str, object]:
     }
 
 
-@mcp.tool(app=AppConfig(resource_uri=MONITOR_URI, visibility=["model", "app"]))
+@mcp.tool(
+    app=AppConfig(resource_uri=MONITOR_URI, visibility=["model", "app"]),
+    # Admin-gated: it reports the container's address, memory, CPU and the
+    # host's load. That is infrastructure detail, and a template should not
+    # hand it to every caller by default.
+    auth=is_admin,
+)
 def monitor() -> dict[str, object]:
     """Live vitals for the container instance that served this call.
 
-    Renders as a dashboard on hosts that support MCP Apps.
+    Renders as a dashboard on hosts that support MCP Apps. Admin only.
     """
     global _calls_served
     _calls_served += 1
@@ -577,7 +736,17 @@ def delete_notes(folder: str, ctx: Context) -> str | InputRequiredToolResult:
                         ),
                     )
                 },
-                request_state=json.dumps({"folder": folder, "count": doomed}),
+                # Sealing makes the state unforgeable, not unusable by someone
+                # else. It goes to the client and comes back, so it says who
+                # it was minted for and when it stops being valid.
+                request_state=json.dumps(
+                    {
+                        "folder": folder,
+                        "count": doomed,
+                        "sub": _caller_sub(),
+                        "exp": int(time.time()) + STATE_TTL_SECONDS,
+                    }
+                ),
             )
         )
 
@@ -587,6 +756,12 @@ def delete_notes(folder: str, ctx: Context) -> str | InputRequiredToolResult:
         return f"Cancelled — nothing deleted from '{folder}'."
 
     carried = json.loads(ctx.request_state) if ctx.request_state else {}
+
+    if carried.get("exp", 0) < time.time():
+        return "That confirmation expired. Start again."
+    if carried.get("sub") != _caller_sub():
+        return "That confirmation was issued to a different caller."
+
     if not (answer.content or {}).get("value"):
         return f"Declined — nothing deleted from '{folder}'."
 
@@ -608,4 +783,5 @@ if __name__ == "__main__":
         # request), so BOTH eras fan out across every instance and the Worker
         # needs no era-aware routing. See NOTES.md.
         stateless_http=True,
+        middleware=[Middleware(RequestLimits)],
     )

@@ -1,0 +1,18 @@
+version: 2
+updates:
+  # Versions are pinned exactly, in both requirements.txt and package.json, so
+  # nothing moves on its own. That is the point — but it also means security
+  # advisories have to arrive as pull requests rather than as a range quietly
+  # resolving to something newer.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

@@ -7,7 +7,13 @@
 #   python -c "import secrets; print(secrets.token_hex(32))"
 REQUEST_STATE_KEY=""
 
-# Optional — Cloudflare Access. Omit both to deploy with NO authentication.
+# Cloudflare Access. Leave these empty and the server will refuse to boot
+# unless ALLOW_OPEN_MODE below is set — deploying open has to be deliberate.
 ACCESS_TEAM_DOMAIN=""     # yourteam.cloudflareaccess.com
 ACCESS_AUD=""             # the Access application's AUD tag
 ADMIN_EMAILS=""           # comma-separated, may call admin-gated tools
+
+# Only set this if you genuinely want a public deployment with no auth. It
+# also makes every caller an admin, so /host and delete_notes are open to
+# anyone with the URL. Leave it empty for anything real.
+ALLOW_OPEN_MODE=""

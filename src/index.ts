@@ -34,6 +34,12 @@ interface Env {
   ACCESS_AUD?: string;
   /** Comma-separated emails allowed to call admin-gated tools. */
   ADMIN_EMAILS?: string;
+  /**
+   * "1" lets the container boot with no authentication, which it otherwise
+   * refuses to do. Open mode also makes every caller an admin. Local dev and
+   * demos only.
+   */
+  ALLOW_OPEN_MODE?: string;
 }
 
 /**
@@ -65,6 +71,7 @@ export class FastMCPContainer extends Container<Env> {
     ACCESS_TEAM_DOMAIN: this.env.ACCESS_TEAM_DOMAIN ?? "",
     ACCESS_AUD: this.env.ACCESS_AUD ?? "",
     ADMIN_EMAILS: this.env.ADMIN_EMAILS ?? "",
+    ALLOW_OPEN_MODE: this.env.ALLOW_OPEN_MODE ?? "",
   };
 }
 
@@ -90,6 +97,15 @@ export default {
     // Without that flag this breaks: a legacy client's `initialize` mints an
     // `Mcp-Session-Id` in one container's memory and its next request lands
     // somewhere else. See NOTES.md.
+    // A browser will not send Origin on a same-origin POST, and cannot forge
+    // it cross-origin. So a present-and-different Origin is a cross-site
+    // caller, and /host rides an Access session with a destructive control on
+    // it. Non-browser clients send no Origin at all and are unaffected.
+    const origin = request.headers.get("origin");
+    if (origin && origin !== new URL(request.url).origin) {
+      return new Response("cross-origin request refused", { status: 403 });
+    }
+
     const instance = await getRandom(env.MCP_CONTAINER, INSTANCES);
     return instance.fetch(withAccessIdentity(request));
   },
