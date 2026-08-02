@@ -25,7 +25,9 @@ STATE="${6:-}"
 MRTR=""
 if [ -n "$RESPONSES" ]; then
   MRTR=",\"inputResponses\":$RESPONSES"
-  [ -n "$STATE" ] && MRTR="$MRTR,\"requestState\":$(printf '%s' "$STATE" | sed 's/"/\\"/g; s/^/"/; s/$/"/')"
+  # Backslashes first, then quotes. The other order double-escapes anything
+  # already containing \" and produces invalid JSON.
+  [ -n "$STATE" ] && MRTR="$MRTR,\"requestState\":$(printf '%s' "$STATE" | sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/')"
 fi
 
 META='"_meta":{

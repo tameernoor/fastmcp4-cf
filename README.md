@@ -111,8 +111,12 @@ uv venv --python 3.12 .venv                    # or: python3.12 -m venv .venv
 uv pip install --prerelease=allow -r requirements.txt
 
 REQUEST_STATE_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))") \
-  PORT=9000 .venv/bin/python server.py
+  ALLOW_OPEN_MODE=1 PORT=9000 .venv/bin/python server.py
 ```
+
+`ALLOW_OPEN_MODE=1` is required with no Cloudflare Access configured. The server
+exits without it rather than come up unauthenticated by accident, and in that
+mode every caller is an admin.
 
 In another shell:
 
@@ -128,7 +132,7 @@ In another shell:
 
 ```bash
 uv pip install --prerelease=allow 'fastmcp[apps]'   # dev-only; NOT in the image
-.venv/bin/fastmcp dev apps server.py
+ALLOW_OPEN_MODE=1 .venv/bin/fastmcp dev apps server.py
 ```
 
 A tool picker, a real host bridge, and a JSON-RPC log panel. One process, so the
@@ -138,7 +142,7 @@ instance never changes — for that you want the Worker.
 
 ```bash
 npm install
-cp .dev.vars.example .dev.vars
+cp .dev.vars.example .dev.vars                              # has ALLOW_OPEN_MODE=1
 python3 -c "import secrets; print(secrets.token_hex(32))"   # paste into .dev.vars
 npm run dev                                                 # :8787 by default
 ```
@@ -312,10 +316,15 @@ npm run check        # wrangler deploy --dry-run
 
 ## Authentication
 
-**Off by default** — as cloned, anyone with the URL can call every tool, and the
-server says so on boot. That includes `/host`, which is a working console with a
-destructive button on it, so deploying this open publishes rather more than an
-API. Access covers the whole Worker, `/mcp` and `/host` alike.
+**The server refuses to boot without a decision about it.** With
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` unset it exits unless `ALLOW_OPEN_MODE=1`
+is set too — open is a fine thing to want locally and a bad thing to reach by
+accident.
+
+Open mode means no authentication *and* every caller is an admin, so `monitor`
+and `delete_notes` are callable by anyone with the URL. That includes `/host`, a
+working console with a destructive button on it. Access covers the whole Worker,
+`/mcp` and `/host` alike.
 
 **Cloudflare Access** is wired up and needs no code: Access runs the OAuth flow
 at the edge and forwards a signed JWT, which `server.py` verifies.

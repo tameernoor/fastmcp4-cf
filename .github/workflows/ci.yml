@@ -17,7 +17,20 @@ jobs:
       - name: Compile server.py
         run: python -m py_compile server.py
       - name: Shellcheck probe.sh
-        run: shellcheck probe.sh
+        run: shellcheck probe.sh redeploy.sh
+
+      # The server must not come up unauthenticated by accident. Booting with
+      # neither ACCESS_* nor ALLOW_OPEN_MODE has to fail, or the whole gate is
+      # decoration.
+      - name: Refuses to boot unauthenticated without ALLOW_OPEN_MODE
+        run: |
+          pip install --pre -r requirements.txt
+          if REQUEST_STATE_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')" \
+             PORT=9099 timeout 20 python server.py > /tmp/boot.log 2>&1; then
+            echo "server booted with no auth and no ALLOW_OPEN_MODE"; cat /tmp/boot.log; exit 1
+          fi
+          grep -q "ALLOW_OPEN_MODE" /tmp/boot.log || { echo "wrong failure:"; cat /tmp/boot.log; exit 1; }
+          echo "ok: refused to boot, and said why"
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -26,6 +39,27 @@ jobs:
       # type-check, so without this the Worker is never checked at all.
       - name: Typecheck the Worker
         run: npm run typecheck
+
+  # Versions are pinned exactly in both ecosystems, which stops surprises but
+  # also means nothing picks up a security fix on its own. These are how we
+  # hear about one.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci
+      - name: npm audit
+        run: npm audit --audit-level=moderate
+      - name: pip-audit
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
 
   build:
     runs-on: ubuntu-latest
@@ -56,8 +90,13 @@ jobs:
           python-version: "3.12"
       - run: npm ci
 
+      # ALLOW_OPEN_MODE is required: with no ACCESS_* configured the server
+      # refuses to boot rather than come up unauthenticated by accident. CI is
+      # exactly the case that wants it on purpose.
       - name: Generate a request-state key
-        run: python -c "import secrets; print(f'REQUEST_STATE_KEY=\"{secrets.token_hex(32)}\"')" > .dev.vars
+        run: |
+          python -c "import secrets; print(f'REQUEST_STATE_KEY=\"{secrets.token_hex(32)}\"')" > .dev.vars
+          echo 'ALLOW_OPEN_MODE="1"' >> .dev.vars
 
       - name: Start wrangler dev
         run: |
@@ -180,6 +219,57 @@ jobs:
           body = json.loads(r['content'][0]['text'])
           assert body['instance'] and body['calls_served'] >= 1, body
           print('ok: readable without the extension —', body['instance'])"
+
+      # The limits exist because both of these returned 200 before: a 1 MB body
+      # and a 500-level nested object were accepted and parsed.
+      - name: Oversized and deeply nested bodies are rejected
+        run: |
+          set -euo pipefail
+          python -c "
+          import json
+          print(json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{
+            'name':'whoami','arguments':{'pad':'A'*400000},
+            '_meta':{'io.modelcontextprotocol/protocolVersion':'2026-07-28',
+                     'io.modelcontextprotocol/clientInfo':{'name':'ci','version':'1'},
+                     'io.modelcontextprotocol/clientCapabilities':{}}}}))" > /tmp/big.json
+          python -c "
+          import json
+          o={'a':1}
+          for _ in range(500): o={'a':o}
+          print(json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/call','params':{
+            'name':'whoami','arguments':{'deep':o},
+            '_meta':{'io.modelcontextprotocol/protocolVersion':'2026-07-28',
+                     'io.modelcontextprotocol/clientInfo':{'name':'ci','version':'1'},
+                     'io.modelcontextprotocol/clientCapabilities':{}}}}))" > /tmp/deep.json
+          for f in big:413 deep:400; do
+            file="/tmp/${f%%:*}.json"; want="${f##*:}"
+            got=$(curl -sS -o /dev/null -w '%{http_code}' -X POST http://localhost:8787/mcp \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -H 'MCP-Protocol-Version: 2026-07-28' \
+              -H 'Mcp-Method: tools/call' -H 'Mcp-Name: whoami' -d @"$file")
+            [ "$got" = "$want" ] || { echo "$file: expected $want, got $got"; exit 1; }
+            echo "ok: $file -> $got"
+          done
+
+      # The header is a routing and integrity signal, so a mismatch must not be
+      # silently ignored. Both name-bearing methods are checked.
+      - name: Mcp-Name mismatch is rejected
+        run: |
+          set -euo pipefail
+          meta='"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ci","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}'
+          curl -sS -X POST http://localhost:8787/mcp \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -H 'MCP-Protocol-Version: 2026-07-28' \
+            -H 'Mcp-Method: tools/call' -H 'Mcp-Name: monitor' \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"whoami\",\"arguments\":{},$meta}}" \
+            | python -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          assert 'error' in d, 'mismatched Mcp-Name was ACCEPTED: ' + json.dumps(d)
+          assert d['error']['code'] == -32020, d['error']
+          print('ok: rejected —', d['error']['message'])"
 
       - name: Tampered request_state is rejected
         run: |

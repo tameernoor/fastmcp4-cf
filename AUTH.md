@@ -1,9 +1,14 @@
 # Auth on a FastMCP 4 / MCP 2026-07-28 server
 
-**This template ships with authentication off.** As cloned, anyone who finds
-the URL can call every tool, and the server warns about it on boot. Read this
-before exposing it — [Option 0](#option-0--cloudflare-access-what-this-template-wires-up)
-is the shortest path to closing it.
+**This template does not boot without a decision about authentication.** With
+`ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` unset, the server exits unless
+`ALLOW_OPEN_MODE=1` is also set. Open mode is a fine thing to want locally and a
+bad thing to reach by accident, so it has to be asked for.
+
+Open mode means exactly what it says: no authentication, and **every caller is
+an admin**, so `monitor` and `delete_notes` are callable by anyone with the URL.
+[Option 0](#option-0--cloudflare-access-what-this-template-wires-up) is the
+shortest path to closing that.
 
 Everything marked ✅ was verified directly against `fastmcp==4.0.0b1` /
 `mcp==2.0.0`. Everything else is from the spec or FastMCP's docs, linked at the
@@ -425,6 +430,31 @@ when non-engineers must change access, when roles outgrow a dict, or when you
 need audit trails and revocation you didn't build.
 
 Either way you still need audience validation — see Hard rules.
+
+---
+
+## What auth does not cover
+
+Authentication decides who gets in. Three things it leaves open, all of which
+bit this repo in a security review:
+
+**Rate limiting.** There is none in the code, and a flood sustained 1,200 req/s
+against three containers in testing. `max_instances = 3` is the ceiling, so the
+pool cannot absorb a burst by growing. Put a Cloudflare rate-limiting rule on
+`/mcp` — roughly 60 requests per minute per IP is generous for real MCP traffic
+— rather than trying to solve it in the Worker, where you would need a Durable
+Object or KV just to hold the counter.
+
+**Request size and shape.** `MAX_BODY_BYTES` (256 KiB) and `MAX_JSON_DEPTH`
+(64) are enforced in `server.py` before anything parses the body. Before they
+existed, a 1 MB body and a 500-level nested object were both accepted and
+parsed. Raise them if a tool genuinely needs it, and know what you are buying.
+
+**Cross-origin requests.** The Worker refuses a POST whose `Origin` is present
+and not its own. Browsers never send `Origin` on a same-origin POST and cannot
+forge it cross-origin, so this costs legitimate clients nothing — `probe.sh` and
+other non-browser callers send no `Origin` at all. It matters because `/host` is
+a browser page with a destructive control that rides your Access session.
 
 ---
 

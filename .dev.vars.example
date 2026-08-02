@@ -16,3 +16,16 @@ REQUEST_STATE_KEY="replace-me-with-32-plus-bytes-of-secret-randomness"
 # production). See AUTH.md for where to find these in the Zero Trust dashboard.
 # ACCESS_TEAM_DOMAIN="yourteam.cloudflareaccess.com"
 # ACCESS_AUD="your-access-application-aud-tag"
+
+# Required while the two above are unset: the server refuses to boot into an
+# unauthenticated state unless asked to. Open mode also makes every caller an
+# admin, so monitor and delete_notes are callable by anyone with the URL.
+ALLOW_OPEN_MODE=1
+
+# Request limits. Defaults are 256 KiB and 64 levels, which is far above any
+# real MCP request and far below what makes a parser bomb interesting.
+# MAX_BODY_BYTES=262144
+# MAX_JSON_DEPTH=64
+
+# How long a guard tool's question stays answerable, in seconds.
+# STATE_TTL_SECONDS=300

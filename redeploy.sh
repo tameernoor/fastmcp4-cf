@@ -20,13 +20,29 @@ set -a; . ./.deploy.vars; set +a
 echo "==> pushing secrets"
 printf '%s' "$REQUEST_STATE_KEY" | npx wrangler secret put REQUEST_STATE_KEY
 
-# Auth is optional: without these the server boots wide open and says so.
 if [ -n "${ACCESS_TEAM_DOMAIN:-}" ] && [ -n "${ACCESS_AUD:-}" ]; then
   printf '%s' "$ACCESS_TEAM_DOMAIN" | npx wrangler secret put ACCESS_TEAM_DOMAIN
   printf '%s' "$ACCESS_AUD"         | npx wrangler secret put ACCESS_AUD
   [ -n "${ADMIN_EMAILS:-}" ] && printf '%s' "$ADMIN_EMAILS" | npx wrangler secret put ADMIN_EMAILS
+elif [ "${ALLOW_OPEN_MODE:-}" = "1" ]; then
+  # The container refuses to boot unauthenticated unless this reaches it, so a
+  # deliberate open deployment has to push it as a secret like anything else.
+  printf '%s' "1" | npx wrangler secret put ALLOW_OPEN_MODE
+  echo "    (ALLOW_OPEN_MODE=1 — deploying WITHOUT authentication, and every"
+  echo "     caller is an admin. /host and delete_notes will be public.)"
 else
-  echo "    (no ACCESS_* set — deploying WITHOUT authentication)"
+  cat >&2 <<'EOF'
+Refusing to deploy: no ACCESS_TEAM_DOMAIN / ACCESS_AUD in .deploy.vars, and
+ALLOW_OPEN_MODE is not 1.
+
+Deployed without auth, anyone with the URL gets every tool and a browser
+console at /host with a destructive button on it. The container will refuse to
+boot in that state anyway, so this stops you earlier.
+
+  set ACCESS_TEAM_DOMAIN and ACCESS_AUD   (see AUTH.md), or
+  set ALLOW_OPEN_MODE=1                   if you really mean it
+EOF
+  exit 1
 fi
 
 echo "==> deploying"
