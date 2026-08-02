@@ -13,7 +13,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 [ -f .deploy.vars ] || { echo "no .deploy.vars — copy .deploy.vars.example and fill it in"; exit 1; }
-set -a; . ./.deploy.vars; set +a
+set -a
+# .deploy.vars is gitignored, so it is absent wherever this gets linted.
+# shellcheck source=/dev/null
+. ./.deploy.vars
+set +a
 
 : "${REQUEST_STATE_KEY:?missing from .deploy.vars}"
 
